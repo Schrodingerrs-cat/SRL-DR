@@ -1,35 +1,3 @@
-/*******************************************************************************
- * ILC Real-Time Tracker - Command Client
- * 
- * Author: [Your Name]
- * Date: October 2025
- * Version: 1.0
- * 
- * Description:
- *   Interactive command-line client for controlling the ILC simulator.
- *   Connects to the simulator via TCP socket and sends commands to control
- *   the robot, adjust parameters, and monitor performance.
- * 
- * Features:
- *   - Interactive command prompt with help system
- *   - Real-time parameter adjustment (learning rate, smoothing, etc.)
- *   - Shape morphing (circle, ellipse, square, star)
- *   - Preset error scenarios (drift, lag, deformation, noise)
- *   - Status monitoring
- * 
- * Usage:
- *   1. Start simulator first: ./ilc_simulator
- *   2. Then run client: ./ilc_client
- *   3. Type commands at ilc> prompt
- *   4. Type 'help' for command list
- *   5. Type 'quit' to exit
- * 
- * Connection:
- *   Connects to localhost:8765 via TCP socket
- * 
- * License: MIT
- ******************************************************************************/
-
 #include <iostream>
 #include <cstring>
 #include <sys/socket.h>
@@ -37,9 +5,8 @@
 #include <unistd.h>
 #include <sstream>
 
-// Network configuration
-const int SERVER_PORT = 8765;         // Must match simulator's port
-const char* SERVER_IP = "127.0.0.1";  // Localhost (same machine)
+const int SERVER_PORT = 8765;
+const char* SERVER_IP = "127.0.0.1";
 
 class ILCClient {
 private:
