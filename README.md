@@ -1,6 +1,4 @@
-# ILC Real-Time Tracker - C++ Implementation
-
-A complete C++ implementation of Iterative Learning Control (ILC) for trajectory tracking with real-time visualization and command interface.
+# ILC 
 
 ## Architecture
 
