@@ -367,9 +367,6 @@ log.close();
 - **ILC points**: 150 (configurable in code)
 - **TCP latency**: <1ms (localhost)
 - **Memory**: ~10MB
-- **CPU**: <5% on modern systems
-
-## Modification Guide
 
 ### Change Number of Points
 
@@ -394,12 +391,6 @@ static std::vector<Point2D> generateHeart(int numPoints) {
 }
 ```
 
-Register in command handler:
-```cpp
-else if (shapeType == "heart") {
-    newRef = ShapeGenerator::generateHeart(NUM_POINTS);
-}
-```
 
 ### Tune Plant Model
 
@@ -432,27 +423,3 @@ Convergence condition (sufficient):
 ```
 
 Where G is the plant transfer function. Learning rate L must be chosen appropriately.
-
-## License
-
-MIT License - Free for research and educational use.
-
-## Citation
-
-If you use this in research:
-```
-@software{ilc_realtime_tracker,
-  title={ILC Real-Time Trajectory Tracker},
-  author={Your Name},
-  year={2025},
-  description={C++ implementation of Iterative Learning Control with smoothing}
-}
-```
-
-## Contact
-
-For issues, improvements, or questions, please open an issue on GitHub or contact the maintainer.
-
----
-
-**Happy Learning!** 🤖📈
