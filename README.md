@@ -81,6 +81,20 @@ ilc> stop
 ilc> reset
 ```
 
+# 1. Clone the repository
+git clone https://github.com/<your-username>/<your-repo>.git
+cd <your-repo>
+
+# 2. Make the build script executable and build the project
+chmod +x build.sh
+./build.sh
+
+# 3. Start the ILC simulator (Terminal 1)
+./build/ilc_simulator
+
+# 4. Start the command-line client (Terminal 2)
+./build/ilc_client
+
 ## Command Reference
 
 ### Simulation Control
