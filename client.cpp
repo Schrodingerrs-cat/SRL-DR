@@ -106,6 +106,11 @@ void printHelp() {
     std::cout << "  preset deform            - Severe deformation (error 0.65, noise off)\n";
     std::cout << "  preset noise             - Stochastic disturbance (error 0.4, noise on)\n";
     std::cout << "\n";
+    std::cout << "  morph <type> <progress>   - Gradually morph current shape toward another\n";
+    std::cout << "                             Example: morph circle 0.5\n";
+    std::cout << "  dome <r1> <r2> <layers>   - Build layered dome of shrinking circles\n";
+    std::cout << "                             Example: dome 1.5 0.3 10\n";
+
 }
 
 void handlePreset(ILCClient& client, const std::string& preset) {
