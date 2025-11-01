@@ -1,4 +1,6 @@
 // simulator.cpp
+// (FULL FILE — updated per your requests: 2D blue path, realtime RMS, smoother morph -> ILC-like transition)
+
 #include <arpa/inet.h>   // inet_addr
 #include <sys/types.h>
 #include <iostream>
@@ -40,7 +42,6 @@ static double WORLD_MAX_Y =  1.0;
 // vertical stacking for 3D output (z-offset)
 static double globalLayerOffset = 0.0;      // persistent z offset between sends
 static constexpr double DEFAULT_LAYER_HEIGHT = 0.01; // adjust to desired layer height
-
 
 // ============================================================================
 // MATH UTILITIES
@@ -146,7 +147,6 @@ inline int worldToScreenX(double x, int width) {
 inline int worldToScreenY(double y, int height) {
     return static_cast<int>(MARGIN + (1 - (y - WORLD_MIN_Y) / (WORLD_MAX_Y - WORLD_MIN_Y)) * (height - 2 * MARGIN));
 }
-
 
 // ============================================================================
 // SHAPE GENERATOR
@@ -308,6 +308,44 @@ static void updateWorldBounds(const std::vector<Point2D>& shape) {
               << "] Y[" << WORLD_MIN_Y << ", " << WORLD_MAX_Y << "]\n";
 }
 
+static double zoom2DFactor = 1.0;
+
+// Apply 2D zoom by scaling WORLD_MIN/MAX around the centroid of a shape
+static void applyZoom2D(double factor, const std::vector<Point2D> *referenceShape = nullptr) {
+    // factor > 1 => zoom in, factor < 1 => zoom out (multiplicative)
+    if (factor <= 0) return;
+    zoom2DFactor *= factor;
+    // clamp zoom factor to avoid degenerate extremes
+    if (zoom2DFactor < 0.2) zoom2DFactor = 0.2;
+    if (zoom2DFactor > 10.0) zoom2DFactor = 10.0;
+
+    // compute centroid to scale around; prefer provided reference, otherwise use WORLD mid
+    Point2D c;
+    if (referenceShape && !referenceShape->empty()) {
+        c = ShapeGenerator::computeCentroid(*referenceShape);
+    } else {
+        c.x = 0.5 * (WORLD_MIN_X + WORLD_MAX_X);
+        c.y = 0.5 * (WORLD_MIN_Y + WORLD_MAX_Y);
+    }
+
+    double halfW = 0.5 * (WORLD_MAX_X - WORLD_MIN_X);
+    double halfH = 0.5 * (WORLD_MAX_Y - WORLD_MIN_Y);
+
+    halfW /= factor; // if factor > 1, halfW gets smaller -> zoom in
+    halfH /= factor;
+
+    WORLD_MIN_X = c.x - halfW;
+    WORLD_MAX_X = c.x + halfW;
+    WORLD_MIN_Y = c.y - halfH;
+    WORLD_MAX_Y = c.y + halfH;
+}
+
+// Reset 2D zoom to fit provided shape
+static void resetZoom2DToShape(const std::vector<Point2D>& shape) {
+    zoom2DFactor = 1.0;
+    updateWorldBounds(shape);
+}
+
 // ============================================================================
 // ILC CONTROLLER
 // ============================================================================
@@ -327,13 +365,22 @@ private:
     std::vector<std::vector<Point2D>> completedPaths;
 
     double lastRMSError;
-    
+
     // dome adaptation control
     bool domeActive = false;
     std::vector<Point2D> domeTarget;   // target cross-section to converge to
     double domeEpsilon = 1e-3;         // stop when max point distance < this
     double domeMorphStep = 0.1;        // how aggressively to morph reference toward domeTarget per iteration
 
+    // --- Morph transition support (gradual transition when new shape is requested)
+    bool morphActive = false;
+    std::vector<Point2D> morphTarget;
+    double morphProgress = 0.0;   // 0..1
+    double morphStep = 0.08;      // progress increment per iteration (tuneable; smaller = smoother)
+
+    // *** CHANGED: parameters controlling morph-as-error behavior
+    double morphVirtualCorrectionFactor = 0.5; // how much of the morph is applied as virtual error to corrections
+    double morphSmoothingMultiplier = 1.0;     // multiply smoothingAlpha for morph-driven corrections
 
 public:
     ILCController(int nPts, double lr) 
@@ -343,37 +390,49 @@ public:
         reference = ShapeGenerator::generateCircle(numPoints);
     }
 
-	void setReference(const std::vector<Point2D>& ref) {
-	    if (ref.empty()) return;
-	    reference = ref;
-	    updateWorldBounds(ref);
-	    reference.resize(numPoints);
-	    std::cout << "[ILC] Reference updated (adaptive tracking continues)\n";
-	}
+    void setReference(const std::vector<Point2D>& ref) {
+        if (ref.empty()) return;
+        reference = ref;
+        updateWorldBounds(ref);
+        reference.resize(numPoints);
+        std::cout << "[ILC] Reference updated (adaptive tracking continues)\n";
+    }
 
-	// Start dome convergence: target is a full shape (same size as reference)
-	    void startDomeToTarget(const std::vector<Point2D>& target) {
-		if (target.empty()) return;
-		domeTarget = target;
-		// ensure domeTarget has same point count as reference
-		if (domeTarget.size() != (size_t)numPoints) domeTarget.resize(numPoints, domeTarget.back());
-		domeActive = true;
-		std::cout << "[ILC] Dome mode started (adaptive convergence)\n";
-	    }
+    // Start a gradual morph toward newShape (runs over several completeIteration() calls)
+    void startMorphTo(const std::vector<Point2D>& newShape, double step = 0.08) {
+        if (newShape.empty()) return;
+        morphTarget = newShape;
+        if (morphTarget.size() != (size_t)numPoints) morphTarget.resize(numPoints, morphTarget.back());
+        morphProgress = 0.0;
+        morphStep = std::max(0.005, std::min(0.3, step));
+        morphActive = true;
+        std::cout << "[ILC] startMorphTo called (step=" << morphStep << ")\n";
+    }
 
-	    void stopDome() {
-		domeActive = false;
-		std::cout << "[ILC] Dome mode stopped\n";
-	    }
 
-	    bool isDomeActive() const { return domeActive; }
+    // Start dome convergence: target is a full shape (same size as reference)
+    void startDomeToTarget(const std::vector<Point2D>& target) {
+        if (target.empty()) return;
+        domeTarget = target;
+        // ensure domeTarget has same point count as reference
+        if (domeTarget.size() != (size_t)numPoints) domeTarget.resize(numPoints, domeTarget.back());
+        domeActive = true;
+        std::cout << "[ILC] Dome mode started (adaptive convergence)\n";
+    }
 
-	    // Create a 'zero-dimension' target (collapse to centroid)
-	    std::vector<Point2D> makeCollapsedTarget() const {
-		Point2D c = ShapeGenerator::computeCentroid(reference);
-		std::vector<Point2D> tgt(numPoints, c);
-		return tgt;
-	    }
+    void stopDome() {
+        domeActive = false;
+        std::cout << "[ILC] Dome mode stopped\n";
+    }
+
+    bool isDomeActive() const { return domeActive; }
+
+    // Create a 'zero-dimension' target (collapse to centroid)
+    std::vector<Point2D> makeCollapsedTarget() const {
+        Point2D c = ShapeGenerator::computeCentroid(reference);
+        std::vector<Point2D> tgt(numPoints, c);
+        return tgt;
+    }
 
     // New: gradually transform reference shape into a new one over multiple iterations
     void morphReferenceTo(const std::vector<Point2D>& newShape, double progress) {
@@ -399,7 +458,6 @@ public:
         }
         std::cout << "[ILC] Dome layers generated (" << totalLayers << " layers)\n";
     }
-
 
     Point2D plantModel(const Point2D& command, int pathIndex) {
         Point2D output = command;
@@ -437,6 +495,19 @@ public:
         return output;
     }
 
+    // *** CHANGED: compute realtime error each time we sample a point (helps shape-change RMS)
+    void updateRealtimeError() {
+        if (currentTrajectory.empty()) return;
+        double total = 0.0;
+        size_t n = currentTrajectory.size();
+        for (size_t i = 0; i < n && i < reference.size(); ++i) {
+            double dx = reference[i].x - currentTrajectory[i].x;
+            double dy = reference[i].y - currentTrajectory[i].y;
+            total += dx*dx + dy*dy;
+        }
+        lastRMSError = std::sqrt(total / std::max<size_t>(1, n));
+    }
+
     Point2D getCurrentPosition(int pathIndex) {
         if (pathIndex >= numPoints) pathIndex = numPoints - 1;
 
@@ -455,6 +526,9 @@ public:
         } else {
             currentTrajectory[pathIndex] = actual;
         }
+
+        // update realtime RMS/error based on observed currentTrajectory
+        updateRealtimeError(); // *** CHANGED: keeps lastRMSError updated continuously
 
         return actual;
     }
@@ -503,7 +577,50 @@ public:
 
         iteration++;
         lastErrors = trackingErrors;
-        
+
+        // --- If morphActive, advance morphProgress and update reference gradually ---
+        if (morphActive && !morphTarget.empty()) {
+            morphProgress += morphStep;
+            if (morphProgress >= 1.0) {
+                reference = morphTarget;
+                morphActive = false;
+                morphProgress = 1.0;
+                std::cout << "[ILC] Morph complete (reference replaced)\n";
+            } else {
+                // smoothstep blending for nicer ease-in/out
+                double t = morphProgress;
+                double s = t*t*(3 - 2*t);
+                auto morphed = ShapeGenerator::morphShapes(reference, morphTarget, s);
+
+                // *** CHANGED: treat part of the morph as a virtual error so corrections adapt similarly to error-driven updates.
+                // This makes the ILC respond to shape-change similarly to how it responds to plant error (reduces jumps).
+                for (int i = 0; i < numPoints; ++i) {
+                    double vx = morphed[i].x - reference[i].x; // desired delta
+                    double vy = morphed[i].y - reference[i].y;
+
+                    // Virtual "error" scaled down by morphVirtualCorrectionFactor
+                    double proposedDeltaX = learningRate * (vx * morphVirtualCorrectionFactor);
+                    double proposedDeltaY = learningRate * (vy * morphVirtualCorrectionFactor);
+
+                    corrections[i].x += smoothingAlpha * morphSmoothingMultiplier * proposedDeltaX;
+                    corrections[i].y += smoothingAlpha * morphSmoothingMultiplier * proposedDeltaY;
+
+                    double correctionMag = std::sqrt(corrections[i].x * corrections[i].x +
+                                                    corrections[i].y * corrections[i].y);
+                    if (correctionMag > 1.0) {
+                        corrections[i].x = (corrections[i].x / correctionMag) * 1.0;
+                        corrections[i].y = (corrections[i].y / correctionMag) * 1.0;
+                    }
+                }
+
+                // finally update the reference gradually (so the visual reference moves smoothly)
+                reference = morphed;
+                // keep bounds updated for the visualizer
+                updateWorldBounds(reference);
+                std::cout << "[ILC] Morph progress: " << std::fixed << std::setprecision(3) << morphProgress << "\n";
+            }
+        }
+
         // --- If dome mode is active, morph the reference gradually toward domeTarget ---
         if (domeActive && !domeTarget.empty()) {
             // compute max distance to target
@@ -541,13 +658,12 @@ public:
             completedPaths.erase(completedPaths.begin());
         }
 
-
         currentTrajectory.clear();
-        
-	if (iteration > 1) {
-	    std::cout << "[ILC] Adapting to possibly new reference — RMS Error now: " 
-		      << lastRMSError << std::endl;
-	}
+
+        if (iteration > 1) {
+            std::cout << "[ILC] Adapting to possibly new reference — RMS Error now: " 
+                      << lastRMSError << std::endl;
+        }
         return rmsError;
     }
 
@@ -606,18 +722,20 @@ public:
 };
 
 // ============================================================================
-// X11 VISUALIZER
+// X11 VISUALIZER (double-buffered via Pixmap)
 // ============================================================================
 class X11Visualizer {
-private:
+public:
     Display* display;
     Window window;
+private:
     GC gc;
     int screen;
     XColor colors[10];
-
+    Pixmap backBuffer;
+    int bufW, bufH;
 public:
-    X11Visualizer() {
+    X11Visualizer() : backBuffer(None), bufW(WINDOW_SIZE), bufH(WINDOW_SIZE) {
         display = XOpenDisplay(nullptr);
         if (!display) {
             std::cerr << "Cannot open X display" << std::endl;
@@ -630,92 +748,116 @@ public:
                                      BlackPixel(display, screen),
                                      WhitePixel(display, screen));
 
-        XSelectInput(display, window, ExposureMask | KeyPressMask);
+        // accept mouse/buttons for zoom/pan if needed
+        XSelectInput(display, window,
+             ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+
         XMapWindow(display, window);
         XStoreName(display, window, "ILC Real-Time Tracker");
 
         gc = XCreateGC(display, window, 0, nullptr);
 
-        // Initialize colors
+        // Initialize colors (now simple, pleasant palette)
         Colormap colormap = DefaultColormap(display, screen);
-        XParseColor(display, colormap, "#22c55e", &colors[0]); // Green (reference)
-        XParseColor(display, colormap, "#2563eb", &colors[1]); // Blue (trajectory)
-        XParseColor(display, colormap, "#dc2626", &colors[2]); // Red (error)
-        XParseColor(display, colormap, "#f59e0b", &colors[3]); // Orange (robot learning)
-        XParseColor(display, colormap, "#f0f0f0", &colors[4]); // Grid
-        XParseColor(display, colormap, "#666666", &colors[5]); // Dark gray
+        XParseColor(display, colormap, "#e6eef6", &colors[0]); // nice light (reference)
+        // *** CHANGED: colors[1] set to blue for 2D path & robot outline
+        XParseColor(display, colormap, "#2b6fb3", &colors[1]); // blue path / outline
+        XParseColor(display, colormap, "#ccdff0", &colors[2]); // grid / background accents
+        XParseColor(display, colormap, "#f0f0f0", &colors[3]);
+        XParseColor(display, colormap, "#666666", &colors[4]);
 
-        for (int i = 0; i < 6; i++) {
-            XAllocColor(display, colormap, &colors[i]);
-        }
+        for (int i = 0; i < 5; i++) XAllocColor(display, colormap, &colors[i]);
+
+        // create pixmap backbuffer sized to the window
+        backBuffer = XCreatePixmap(display, window, bufW, bufH, DefaultDepth(display, screen));
     }
 
     ~X11Visualizer() {
+        if (backBuffer != None) XFreePixmap(display, backBuffer);
         XFreeGC(display, gc);
         XDestroyWindow(display, window);
         XCloseDisplay(display);
     }
 
+    Display* getDisplay() { return display; }
+
+    void resizeBuffer(int w, int h) {
+        if (w == bufW && h == bufH) return;
+        if (backBuffer != None) XFreePixmap(display, backBuffer);
+        bufW = std::max(1, w);
+        bufH = std::max(1, h);
+        backBuffer = XCreatePixmap(display, window, bufW, bufH, DefaultDepth(display, screen));
+    }
+
     void clear() {
-        XClearWindow(display, window);
+        // Fill the pixmap with window background color
+        XSetForeground(display, gc, WhitePixel(display, screen));
+        XFillRectangle(display, backBuffer, gc, 0, 0, bufW, bufH);
     }
 
     void drawGrid() {
-        XSetForeground(display, gc, colors[4].pixel);
+        XSetForeground(display, gc, colors[2].pixel);
         XSetLineAttributes(display, gc, 1, LineSolid, CapButt, JoinMiter);
 
         double gridLines[] = {-1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5};
         for (double val : gridLines) {
-            int xPos = worldToScreenX(val, WINDOW_SIZE);
-            int yPos = worldToScreenY(val, WINDOW_SIZE);
-            XDrawLine(display, window, gc, xPos, MARGIN, xPos, WINDOW_SIZE - MARGIN);
-            XDrawLine(display, window, gc, MARGIN, yPos, WINDOW_SIZE - MARGIN, yPos);
+            int xPos = worldToScreenX(val, bufW);
+            int yPos = worldToScreenY(val, bufH);
+            XDrawLine(display, backBuffer, gc, xPos, MARGIN, xPos, bufH - MARGIN);
+            XDrawLine(display, backBuffer, gc, MARGIN, yPos, bufW - MARGIN, yPos);
         }
     }
 
+    // *** CHANGED: drawPath now respects colorIdx (1=normal blue, 2=error color)
     void drawPath(const std::vector<Point2D>& path, int colorIdx, int lineWidth, bool closed = true) {
         if (path.size() < 2) return;
 
-        XSetForeground(display, gc, colors[colorIdx].pixel);
+        // color selection: default -> colors[1] (blue); error -> colors[2] (grid tint) or adjust as needed
+        unsigned long fg = colors[1].pixel;
+        if (colorIdx == 2) fg = colors[2].pixel; // using colors[2] as an "error/highlight" tone
+        XSetForeground(display, gc, fg);
         XSetLineAttributes(display, gc, lineWidth, LineSolid, CapRound, JoinRound);
 
         for (size_t i = 0; i < path.size() - 1; i++) {
-            Point2D s1 = worldToScreen(path[i].x, path[i].y, WINDOW_SIZE, WINDOW_SIZE);
-            Point2D s2 = worldToScreen(path[i+1].x, path[i+1].y, WINDOW_SIZE, WINDOW_SIZE);
-            XDrawLine(display, window, gc, s1.x, s1.y, s2.x, s2.y);
+            Point2D s1 = worldToScreen(path[i].x, path[i].y, bufW, bufH);
+            Point2D s2 = worldToScreen(path[i+1].x, path[i+1].y, bufW, bufH);
+            XDrawLine(display, backBuffer, gc, (int)s1.x, (int)s1.y, (int)s2.x, (int)s2.y);
         }
 
         if (closed && path.size() > 2) {
-            int x1 = worldToScreenX(path.back().x, WINDOW_SIZE);
-            int y1 = worldToScreenY(path.back().y, WINDOW_SIZE);
-            int x2 = worldToScreenX(path[0].x, WINDOW_SIZE);
-            int y2 = worldToScreenY(path[0].y, WINDOW_SIZE);
-            XDrawLine(display, window, gc, x1, y1, x2, y2);
+            int x1 = worldToScreenX(path.back().x, bufW);
+            int y1 = worldToScreenY(path.back().y, bufH);
+            int x2 = worldToScreenX(path[0].x, bufW);
+            int y2 = worldToScreenY(path[0].y, bufH);
+            XDrawLine(display, backBuffer, gc, x1, y1, x2, y2);
         }
     }
 
     void drawRobot(const Point2D& pos, int colorIdx, int radius = 10) {
-        Point2D s = worldToScreen(pos.x, pos.y, WINDOW_SIZE, WINDOW_SIZE);
+        Point2D s = worldToScreen(pos.x, pos.y, bufW, bufH);
         int x = static_cast<int>(s.x);
         int y = static_cast<int>(s.y);
 
-        XSetForeground(display, gc, colors[colorIdx].pixel);
-        XFillArc(display, window, gc, x - radius, y - radius,
+        // robot uses outline color (blue) — same palette as path to indicate "current position on path"
+        XSetForeground(display, gc, colors[1].pixel);
+        XFillArc(display, backBuffer, gc, x - radius, y - radius,
                  radius * 2, radius * 2, 0, 360 * 64);
 
         // White border
         XSetForeground(display, gc, WhitePixel(display, screen));
         XSetLineAttributes(display, gc, 2, LineSolid, CapButt, JoinMiter);
-        XDrawArc(display, window, gc, x - radius, y - radius,
+        XDrawArc(display, backBuffer, gc, x - radius, y - radius,
                  radius * 2, radius * 2, 0, 360 * 64);
     }
 
     void drawText(int x, int y, const std::string& text) {
         XSetForeground(display, gc, BlackPixel(display, screen));
-        XDrawString(display, window, gc, x, y, text.c_str(), text.length());
+        XDrawString(display, backBuffer, gc, x, y, text.c_str(), text.length());
     }
 
     void flush() {
+        // copy pixmap buffer to window in a single operation (no flicker)
+        XCopyArea(display, backBuffer, window, gc, 0, 0, bufW, bufH, 0, 0);
         XFlush(display);
     }
 };
@@ -803,21 +945,21 @@ public:
             return false;
         }
 
-	for (const auto &ring : rings) {
-	    for (const auto &p : ring) {
-		std::ostringstream oss;
-		oss << p.x << " " << p.y << " " << p.z << "\n";
-		std::string msg = oss.str();
-		if (send(sockfd, msg.c_str(), msg.size(), 0) < 0) {
-		    std::cerr << "[RendererClient] send() failed (body)\n";
-		    close(sockfd);
-		    sockfd = -1;
-		    connected = false;
-		    return false;
-		}
-		// removed per-point usleep to avoid blocking main loop and to speed transfers
-	    }
-	}
+        for (const auto &ring : rings) {
+            for (const auto &p : ring) {
+                std::ostringstream oss;
+                oss << p.x << " " << p.y << " " << p.z << "\n";
+                std::string msg = oss.str();
+                if (send(sockfd, msg.c_str(), msg.size(), 0) < 0) {
+                    std::cerr << "[RendererClient] send() failed (body)\n";
+                    close(sockfd);
+                    sockfd = -1;
+                    connected = false;
+                    return false;
+                }
+                // removed per-point usleep to avoid blocking main loop and to speed transfers
+            }
+        }
 
 
         if (send(sockfd, footer.c_str(), footer.size(), 0) < 0) {
@@ -841,6 +983,24 @@ public:
             rings.push_back(std::move(ring));
         }
         return sendPath3D(rings);
+    }
+
+    // Send a short textual command to renderer (best-effort, thread-safe)
+    bool sendCommand(const std::string& cmd) {
+        std::lock_guard<std::mutex> lk(sockMutex);
+        if (!connected || sockfd < 0) {
+            // attempt to connect once
+            if (!connectToRenderer("127.0.0.1", RENDERER_PORT)) return false;
+        }
+        ssize_t sent = send(sockfd, cmd.c_str(), cmd.size(), 0);
+        if (sent < 0) {
+            std::cerr << "[RendererClient] sendCommand failed\n";
+            close(sockfd);
+            sockfd = -1;
+            connected = false;
+            return false;
+        }
+        return true;
     }
 };
 
@@ -953,11 +1113,22 @@ private:
             *isSimRunning = false;
             return "OK: Simulation stopped\n";
         }
-	else if (action == "reset") {
-	    ilc->reset();
-	    globalLayerOffset = 0.0; // reset stacking offset too
-	    return "OK: ILC reset\n";
-	}
+        else if (action == "reset") {
+            ilc->reset();
+            globalLayerOffset = 0.0; // reset stacking offset too
+
+            // reset 2D zoom / world bounds to default cross-section
+            resetZoom2DToShape(ilc->getBaseCrossSection());
+
+            // best-effort: notify 3D renderer to clear view
+            if (!rendererClient.isConnected()) {
+                rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT);
+            }
+            // send a small command the renderer will understand
+            rendererClient.sendCommand("RESET_VIEW\n");
+
+            return "OK: ILC reset (3D view cleared)\n";
+        }
         else if (action == "error") {
             double level;
             iss >> level;
@@ -1011,25 +1182,52 @@ private:
             else {
                 return "ERROR: Unknown shape type\n";
             }
-            // Before switching reference, morph smoothly from previous shape
-            if (!ilc->getCompletedPaths().empty()) {
-                const auto &lastPath = ilc->getCompletedPaths().back();
-                if (!lastPath.empty()) {
-                    std::cout << "[MORPH] Transitioning from current to new shape...\n";
-                    auto last2D = lastPath; // reuse last path’s 2D
-                    auto morphRings = generateMorphRings(last2D, newRef, 12, 0.01);
-                    rendererClient.sendPath3D(morphRings);
-                    // use filename wrapper (string)
-                    writeGCodeForPath(flattenRingsToPath(morphRings), std::string("morph_transition.gcode"));
+
+            // If simulation not running -> treat as default (set immediately, no morph)
+            if (!(*isSimRunning)) {
+                ilc->setReference(newRef);
+                // also reset 2D zoom to fit that shape so initial view makes sense
+                resetZoom2DToShape(ilc->getBaseCrossSection());
+                std::cout << "[COMMAND] Shape set as default (simulation not started)\n";
+                return "OK: Reference shape set (default). Start will use this shape.\n";
+            }
+
+            // If simulation running -> perform smooth online morph WITHOUT shrinking:
+            std::vector<Point2D> currentRef = ilc->getBaseCrossSection();
+
+            // compute max radius of currentRef and newRef and scale newRef so its size matches currentRef
+            auto maxRadius = [](const std::vector<Point2D>& s)->double {
+                if (s.empty()) return 1.0;
+                Point2D c = ShapeGenerator::computeCentroid(s);
+                double mr = 0;
+                for (auto &p: s) mr = std::max(mr, std::hypot(p.x - c.x, p.y - c.y));
+                return mr;
+            };
+            double rCur = std::max(1e-8, maxRadius(currentRef));
+            double rNew = std::max(1e-8, maxRadius(newRef));
+            double scaleFactor = rCur / rNew;
+
+            if (std::abs(scaleFactor - 1.0) > 1e-9) {
+                Point2D cNew = ShapeGenerator::computeCentroid(newRef);
+                for (auto &p : newRef) {
+                    p.x = cNew.x + (p.x - cNew.x) * scaleFactor;
+                    p.y = cNew.y + (p.y - cNew.y) * scaleFactor;
                 }
             }
 
-		std::cout << "[COMMAND] Received new shape: " << shapeType 
-			  << " — updating reference only (no reset)\n";
+            // Visualize a short morph preview using the current reference (not last completed path)
+            auto morphFrom = currentRef;
+            auto morphRings = generateMorphRings(morphFrom, newRef, 12, 0.01);
+            if (!rendererClient.isConnected()) rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT);
+            rendererClient.sendPath3D(morphRings);
+            writeGCodeForPath(flattenRingsToPath(morphRings), std::string("morph_transition.gcode"));
 
-		ilc->setReference(newRef);  // just update reference mid-run
-		return "OK: Reference shape updated to " + shapeType + " — ILC adapting online\n";
+            // Start the ILC gradual morph (ILC will update reference over iterations)
+            ilc->startMorphTo(newRef, 0.06);
+            std::cout << "[COMMAND] Starting runtime morph to new shape\n";
+            return "OK: Reference will morph to " + shapeType + " — ILC adapting online\n";
         }
+
 
         else if (action == "morph") {
             std::string shapeType;
@@ -1084,8 +1282,6 @@ private:
             resp << "…)";
             return resp.str() + " — ILC will adapt until convergence\n";
         }
-
-
 
         else if (action == "status") {
             std::ostringstream oss;
@@ -1209,6 +1405,9 @@ int main() {
     Point2D robotPos(1, 0);
 
     auto lastTime = std::chrono::steady_clock::now();
+    // track dome active state so we can stop when dome converges
+    bool prevDomeActive = ilc.isDomeActive();
+
 
     // Single combined G-code file opened in append mode
     static std::ofstream gcodeFile("ilc_path_combined.gcode", std::ios::app);
@@ -1234,116 +1433,161 @@ int main() {
                     // Check for iteration completion
                     if (pathIndex == 0 && time > NUM_POINTS &&
                         ilc.getCurrentTrajectory().size() >= (size_t)NUM_POINTS) {
+
                         ilc.completeIteration();
                         time = 0;
+
+                        // After completing an iteration, if dome just finished (transitioned from active->inactive),
+                        // stop the simulation automatically.
+                        bool nowDomeActive = ilc.isDomeActive();
+                        if (prevDomeActive && !nowDomeActive) {
+                            isRunning = false;
+                            std::cout << "[MAIN] Dome convergence complete -> simulation stopped\n";
+                        }
+                        prevDomeActive = nowDomeActive;
                     }
 
                     // Update the 3D view here so it syncs with new layers
-                
-                    bool domePhaseActive = false; // placeholder
-		// ----------------------- send observed/completed layers (throttled) -----------------------
-		// Build rings from ilc.completedPaths (observed) and currentTrajectory as top layer.
-		// Send only the *new* layers that haven't been sent yet to avoid spamming heavy data.
-		static size_t lastSentLayerCount = 0;
-		double layerHeight = 0.1;
 
-		auto completed = ilc.getCompletedPaths(); // vector<vector<Point2D>>
-		std::vector<std::vector<Point3D>> toSend;
+                    // ----------------------- send observed/completed layers (throttled) -----------------------
+                    // Build rings from ilc.completedPaths (observed) and currentTrajectory as top layer.
+                    // Send only the *new* layers that haven't been sent yet to avoid spamming heavy data.
+                    static size_t lastSentLayerCount = 0;
+                    double layerHeight = 0.1;
 
-		// convert completed paths -> rings, set z = layerIndex * layerHeight
-		for (size_t li = 0; li < completed.size(); ++li) {
-		    if (li < lastSentLayerCount) continue; // already sent this layer
-		    std::vector<Point3D> ring;
-		    ring.reserve(completed[li].size());
-		    for (const auto &p : completed[li]) ring.emplace_back(p.x, p.y, (double)li * layerHeight);
-		    toSend.push_back(std::move(ring));
-		}
+                    auto completed = ilc.getCompletedPaths(); // vector<vector<Point2D>>
+                    std::vector<std::vector<Point3D>> toSend;
 
-		// optionally send the current partial trajectory as top visualization (observed so far)
-		const auto& curTraj = ilc.getCurrentTrajectory();
-		if (!curTraj.empty()) {
-		    std::vector<Point3D> curRing;
-		    curRing.reserve(curTraj.size());
-		    double zTop = (double)completed.size() * layerHeight;
-		    for (const auto &p : curTraj) curRing.emplace_back(p.x, p.y, zTop);
-		    toSend.push_back(std::move(curRing));
-		}
+                    // convert completed paths -> rings, set z = layerIndex * layerHeight
+                    for (size_t li = 0; li < completed.size(); ++li) {
+                        if (li < lastSentLayerCount) continue; // already sent this layer
+                        std::vector<Point3D> ring;
+                        ring.reserve(completed[li].size());
+                        for (const auto &p : completed[li]) ring.emplace_back(p.x, p.y, (double)li * layerHeight);
+                        toSend.push_back(std::move(ring));
+                    }
 
-
-		// copy of toSend is already local; release lock (we are inside lock already in your code snippet)
-		// so instead of calling sendPath3D under ilcMutex, spawn a thread:
-		if (!toSend.empty()) {
-		    std::thread sender([toSend]() mutable {
-			// attempt to ensure connection before sending; rendererClient is thread-safe via its mutex
-			// keep a couple retries if disconnected
-			for (int attempt = 0; attempt < 2; ++attempt) {
-			    if (rendererClient.isConnected() || rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT)) {
-				rendererClient.sendPath3D(toSend);
-				break;
-			    }
-			    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-			}
-		    });
-		    sender.detach();
-
-		    // update lastSentLayerCount only for fully completed layers (not for currentTrajectory)
-		    lastSentLayerCount = completed.size();
-		}
+                    // optionally send the current partial trajectory as top visualization (observed so far)
+                    const auto& curTraj = ilc.getCurrentTrajectory();
+                    if (!curTraj.empty()) {
+                        std::vector<Point3D> curRing;
+                        curRing.reserve(curTraj.size());
+                        double zTop = (double)completed.size() * layerHeight;
+                        for (const auto &p : curTraj) curRing.emplace_back(p.x, p.y, zTop);
+                        toSend.push_back(std::move(curRing));
+                    }
 
 
+                    // copy of toSend is already local; release lock (we are inside lock already in your code snippet)
+                    // so instead of calling sendPath3D under ilcMutex, spawn a thread:
+                    if (!toSend.empty()) {
+                        std::thread sender([toSend]() mutable {
+                            // attempt to ensure connection before sending; rendererClient is thread-safe via its mutex
+                            // keep a couple retries if disconnected
+                            for (int attempt = 0; attempt < 2; ++attempt) {
+                                if (rendererClient.isConnected() || rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT)) {
+                                    rendererClient.sendPath3D(toSend);
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
+                        });
+                        sender.detach();
 
+                        // update lastSentLayerCount only for fully completed layers (not for currentTrajectory)
+                        lastSentLayerCount = completed.size();
+                    }
 
-		// Write G-code only for newly completed layers (not current in-progress ring)
-		if (!completed.empty() && gcodeFile.is_open()) {
-		    for (size_t li = lastSentLayerCount; li < completed.size(); ++li) {
-			std::vector<Point3D> layer3d;
-			layer3d.reserve(completed[li].size());
-			double z = li * layerHeight;
-			for (const auto &p : completed[li]) layer3d.emplace_back(p.x, p.y, z);
-			writeGCodeForPath(layer3d, gcodeFile);
-		    }
-		}
+                    // Write G-code only for newly completed layers (not current in-progress ring)
+                    if (!completed.empty() && gcodeFile.is_open()) {
+                        for (size_t li = lastSentLayerCount; li < completed.size(); ++li) {
+                            std::vector<Point3D> layer3d;
+                            layer3d.reserve(completed[li].size());
+                            double z = li * layerHeight;
+                            for (const auto &p : completed[li]) layer3d.emplace_back(p.x, p.y, z);
+                            writeGCodeForPath(layer3d, gcodeFile);
+                        }
+                    }
                 }
             }
 
             // 2D rendering
-            viz.clear();
-            viz.drawGrid();
 
+            // ----- poll X events for simple 2D zoom control (mouse wheel + keyboard) -----
             {
-                std::lock_guard<std::mutex> lock(ilcMutex);
-
-                viz.drawPath(ilc.getReference(), 0, 3, true);
-
-                const auto& completed = ilc.getCompletedPaths();
-                for (const auto& path : completed) {
-                    int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
-                    viz.drawPath(path, colorIdx, 2, true);
+                Display* dpy = viz.getDisplay();
+                while (XPending(dpy) > 0) {
+                    XEvent ev;
+                    XNextEvent(dpy, &ev);
+                    if (ev.type == ButtonPress) {
+                        XButtonEvent be = ev.xbutton;
+                        // mouse wheel: button 4 = up, 5 = down
+                        if (be.button == 4) {
+                            // wheel up -> zoom in (factor >1)
+                            applyZoom2D(1.15, &ilc.getBaseCrossSection());
+                        } else if (be.button == 5) {
+                            // wheel down -> zoom out
+                            applyZoom2D(1.0/1.15, &ilc.getBaseCrossSection());
+                        }
+                    } else if (ev.type == KeyPress) {
+                        KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                        if (ks == XK_plus || ks == XK_equal) {
+                            applyZoom2D(1.15, &ilc.getBaseCrossSection());
+                        } else if (ks == XK_minus || ks == XK_underscore) {
+                            applyZoom2D(1.0/1.15, &ilc.getBaseCrossSection());
+                        } else if (ks == XK_r || ks == XK_R) {
+                            // reset 2D zoom/view to current reference
+                            resetZoom2DToShape(ilc.getBaseCrossSection());
+                        }
+                    }
+                    // ignore other events
                 }
-
-                if (ilc.getCurrentTrajectory().size() > 2) {
-                    int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
-                    viz.drawPath(ilc.getCurrentTrajectory(), colorIdx, 3, false);
-                }
-
-                if (isRunning) {
-                    int robotColor = (ilc.getErrorLevel() > 0) ? 2 : 1;
-                    viz.drawRobot(robotPos, robotColor, 10);
-                }
-
-                std::ostringstream ss;
-                ss << "Iteration: " << ilc.getIteration()
-                   << " | RMS Error: " << std::fixed << std::setprecision(4) << ilc.getRMSError()
-                   << " | Error Level: " << (int)(ilc.getErrorLevel() * 100) << "%";
-                viz.drawText(20, 30, ss.str());
             }
+            // ----- end X event polling -----
 
-            viz.flush();
+            // 2D rendering (throttled to ~30 FPS to avoid X11 flashing)
+            static auto lastDraw = std::chrono::steady_clock::now();
+            auto nowDraw = std::chrono::steady_clock::now();
+            auto msSince = std::chrono::duration_cast<std::chrono::milliseconds>(nowDraw - lastDraw).count();
+            if (msSince >= 33) { // ~30 FPS
+                lastDraw = nowDraw;
+
+                viz.clear();
+                viz.drawGrid();
+
+                {
+                    std::lock_guard<std::mutex> lock(ilcMutex);
+
+                    viz.drawPath(ilc.getReference(), 1, 3, true); // reference always blue (colorIdx 1)
+
+                    const auto& completed = ilc.getCompletedPaths();
+                    for (const auto& path : completed) {
+                        int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawPath(path, colorIdx, 2, true);
+                    }
+
+                    if (ilc.getCurrentTrajectory().size() > 2) {
+                        int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawPath(ilc.getCurrentTrajectory(), colorIdx, 3, false);
+                    }
+
+                    if (isRunning) {
+                        int robotColor = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawRobot(robotPos, robotColor, 10);
+                    }
+
+                    std::ostringstream ss;
+                    ss << "Iteration: " << ilc.getIteration()
+                       << " | RMS Error: " << std::fixed << std::setprecision(4) << ilc.getRMSError()
+                       << " | Error Level: " << (int)(ilc.getErrorLevel() * 100) << "%";
+                    viz.drawText(20, 30, ss.str());
+                }
+
+                viz.flush();
+            }
         }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
     return 0;
 }
 

@@ -108,6 +108,14 @@ void recomputeView() {
     cameraDistance = span * 1.5f;
 }
 
+// Safe, clamped zoom helper (call from UI handlers)
+inline void applyZoomDelta(float delta) {
+    zoom += delta;
+    if (zoom < 0.2f) zoom = 0.2f;
+    if (zoom > 50.0f) zoom = 50.0f;
+}
+
+
 // ---------------------------------------------------------------------------
 // TCP SERVER THREAD
 // ---------------------------------------------------------------------------
@@ -193,6 +201,25 @@ void serverThreadFunc() {
                         glutPostRedisplay();
                     }
                 }
+                else if (line == "RESET_VIEW") {
+                    std::lock_guard<std::mutex> lk(dataMutex);
+                    pathRings.clear();
+                    receiveBuffer.clear();
+                    currentReceiveRingSize = 0;
+                    receiveExpectedPoints = 0;
+                    receivedCount = 0;
+                    drawRingIndex = 0;
+                    drawVertexIndex = 0;
+
+                    // reset view parameters to defaults
+                    cameraTargetX = cameraTargetY = cameraTargetZ = 0.0f;
+                    rotX = 25.0f; rotY = -45.0f;
+                    zoom = cameraDistance = 2.5f;
+
+                    recomputeView(); // safe: already acquires dataMutex internally, but we hold it — OK
+                    std::cout << "[Renderer3D] Received RESET_VIEW — cleared view\n";
+                    glutPostRedisplay();
+                }
                 else {
                     std::istringstream iss(line);
                     float x, y, z;
@@ -233,40 +260,46 @@ void drawFilledMesh() {
     std::lock_guard<std::mutex> lk(dataMutex);
     if (pathRings.size() < 1) return;
 
-    // Draw per-layer outlines and strip between adjacent layers properly
+    const float baseR = 0.36f; // greyish-blue base color (#5c708a)
+    const float baseG = 0.44f;
+    const float baseB = 0.54f;
+
     for (size_t r = 0; r + 1 < pathRings.size(); ++r) {
         const auto &A = pathRings[r];
         const auto &B = pathRings[r + 1];
         int N = std::min(A.size(), B.size());
         if (N < 2) continue;
 
-        // pick color from HSV using layer index for high contrast
-	// alternate two contrasting colors only
-	if (r % 2 == 0)
-	    glColor3f(0.9f, 0.2f, 0.2f);   // red
-	else
-	    glColor3f(0.2f, 0.7f, 1.0f);   // blue
+        // soft gradient fade by height
+        float fade = static_cast<float>(r) / std::max((int)pathRings.size() - 1, 1);
+        float R = baseR * (1.0f - 0.3f * fade);
+        float G = baseG * (1.0f - 0.3f * fade);
+        float Bb = baseB * (1.0f - 0.3f * fade);  // renamed from B → Bb
 
+        glColor3f(R, G, Bb);
         glLineWidth(LINE_WIDTH);
-        // draw ring outline for layer A
+
+        // ring outline
         glBegin(GL_LINE_STRIP);
-        for (int i = 0; i < N; ++i) glVertex3f(A[i].x, A[i].y, A[i].z);
+        for (int i = 0; i < N; ++i)
+            glVertex3f(A[i].x, A[i].y, A[i].z);
         glVertex3f(A[0].x, A[0].y, A[0].z);
         glEnd();
 
-        // draw triangle strip connecting A->B (fills between layers)
+        // filled strip between layers with subtle shade difference
         glBegin(GL_TRIANGLE_STRIP);
         for (int i = 0; i < N; ++i) {
+            glColor3f(R, G, Bb);
             glVertex3f(A[i].x, A[i].y, A[i].z);
+            glColor3f(R * 0.9f, G * 0.9f, Bb * 0.9f); // slight gradient
             glVertex3f(B[i].x, B[i].y, B[i].z);
         }
-        // close the strip by repeating first pair
         glVertex3f(A[0].x, A[0].y, A[0].z);
         glVertex3f(B[0].x, B[0].y, B[0].z);
         glEnd();
     }
 
-    // draw current layer cursor (yellow point)
+    // cursor point
     if (drawRingIndex < (int)pathRings.size()) {
         const auto &r = pathRings[drawRingIndex];
         int idx = std::min(drawVertexIndex, (int)r.size() - 1);
@@ -277,7 +310,6 @@ void drawFilledMesh() {
         glEnd();
     }
 }
-
 
 
 // ---------------------------------------------------------------------------
@@ -385,10 +417,10 @@ void mouse(int button, int state, int x, int y) {
         // check for button click
         for (const auto &b : buttons) {
             if (x >= b.x1 && x <= b.x2 && yFlipped >= b.y1 && yFlipped <= b.y2) {
-                if (b.label == "+") zoom -= 0.2f;
-                if (b.label == "-") zoom += 0.2f;
-                glutPostRedisplay();
-                return;
+            if (b.label == "+") applyZoomDelta(-0.2f);
+            if (b.label == "-") applyZoomDelta(0.2f);
+            glutPostRedisplay();
+            return;
             }
         }
 
@@ -419,8 +451,8 @@ void keyboard(unsigned char key, int, int) {
         exit(0);
     }
     if (key == ' ') paused = !paused;
-    if (key == '+' || key == '=') zoom -= 0.2f;
-    if (key == '-' || key == '_') zoom += 0.2f;
+    if (key == '+' || key == '=') applyZoomDelta(-0.2f);
+    if (key == '-' || key == '_') applyZoomDelta(0.2f);
     if (key == 'r' || key == 'R') {
         rotX = 25.0f;
         rotY = -45.0f;
@@ -442,6 +474,10 @@ int main(int argc, char** argv) {
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
     glutInitWindowSize(900, 700);
     glutCreateWindow("ILC 3D Printer Visualizer");
+
+    // ensure winW/winH reflect initial window dimensions before creating buttons
+    winW = 900; winH = 700;
+
     // Define zoom UI buttons
     float bw = 40, bh = 30, pad = 10;
     buttons = {
