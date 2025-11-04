@@ -1,5 +1,4 @@
 // simulator.cpp
-// (FULL FILE — updated per your requests: 2D blue path, realtime RMS, smoother morph -> ILC-like transition)
 
 #include <arpa/inet.h>   // inet_addr
 #include <sys/types.h>
