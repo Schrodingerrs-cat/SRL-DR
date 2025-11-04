@@ -1,0 +1,236 @@
+int main() {
+    std::cout << "=== ILC Real-Time Tracker ===" << std::endl;
+    std::cout << "Initializing..." << std::endl;
+
+    ILCController ilc(NUM_POINTS, 0.4);
+    X11Visualizer viz;
+
+    // Attempt to connect once at startup to external renderer
+    rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT);
+
+    std::atomic<bool> isRunning(false);
+    std::mutex ilcMutex;
+
+    CommandServer server(&ilc, &isRunning, &ilcMutex);
+    server.start();
+
+    std::cout << "\n[READY] Visualization window opened" << std::endl;
+    std::cout << "[READY] Command server listening on port " << SERVER_PORT << std::endl;
+    std::cout << "[READY] Use command client to control simulation" << std::endl;
+
+    double time = 0;
+    int pathIndex = 0;
+    Point2D robotPos(1, 0);
+
+    auto lastTime = std::chrono::steady_clock::now();
+    // track dome active state so we can stop when dome converges
+    bool prevDomeActive = ilc.isDomeActive();
+    
+    // --- Z control state (for gradual/constant alternation) ---
+    static int iterationCounter = 0;        // tracks total iterations
+    static bool gradualZ = true;            // first iteration = gradual
+    static double currentZ = 0.0;           // global Z position in sim units
+    static int zStepIndex = 0;              // small per-point index
+
+
+
+    // Single combined G-code file opened in append mode
+    static std::ofstream gcodeFile("ilc_path_combined.gcode", std::ios::app);
+    if (!gcodeFile.is_open()) {
+        std::cerr << "[GCODE] Warning: cannot open ilc_path_combined.gcode for append\n";
+    }
+
+    while (true) {
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastTime).count();
+
+        if (elapsed >= 16) { // ~60 FPS
+            lastTime = currentTime;
+
+            {
+                std::lock_guard<std::mutex> lock(ilcMutex);
+
+                if (isRunning) {
+                    time += 0.8;
+                    pathIndex = (int)time % NUM_POINTS;
+                    robotPos = ilc.getCurrentPosition(pathIndex);
+
+                    // Check for iteration completion
+                    if (pathIndex == 0 && time > NUM_POINTS &&
+                        ilc.getCurrentTrajectory().size() >= (size_t)NUM_POINTS) {
+
+                        ilc.completeIteration();
+                        time = 0;
+                        
+                            // === Z height scheduling ===
+			    iterationCounter++;
+			    if (gradualZ) {
+				currentZ += Z_INCREMENT_UNITS; // after full gradual iteration, Z is higher by total increment
+			    }
+			    gradualZ = !gradualZ; // toggle mode for next iteration
+			    zStepIndex = 0;       // reset point-based counter
+
+
+                        // After completing an iteration, if dome just finished (transitioned from active->inactive),
+                        // stop the simulation automatically.
+                        bool nowDomeActive = ilc.isDomeActive();
+                        if (prevDomeActive && !nowDomeActive) {
+                            isRunning = false;
+                            std::cout << "[MAIN] Dome convergence complete -> simulation stopped\n";
+                        }
+                        prevDomeActive = nowDomeActive;
+                    }
+
+                    // Update the 3D view here so it syncs with new layers
+
+                    // ----------------------- send observed/completed layers (throttled) -----------------------
+                    // Build rings from ilc.completedPaths (observed) and currentTrajectory as top layer.
+                    // Send only the *new* layers that haven't been sent yet to avoid spamming heavy data.
+                    static size_t lastSentLayerCount = 0;
+                    double layerHeight = 0.1;
+
+                    auto completed = ilc.getCompletedPaths(); // vector<vector<Point2D>>
+                    std::vector<std::vector<Point3D>> toSend;
+
+                    // convert completed paths -> rings, set z = layerIndex * layerHeight
+                    for (size_t li = 0; li < completed.size(); ++li) {
+                        if (li < lastSentLayerCount) continue; // already sent this layer
+                        std::vector<Point3D> ring;
+                        ring.reserve(completed[li].size());
+                        for (const auto &p : completed[li]) ring.emplace_back(p.x, p.y, (double)li * layerHeight);
+                        toSend.push_back(std::move(ring));
+                    }
+
+                    // optionally send the current partial trajectory as top visualization (observed so far)
+                    const auto& curTraj = ilc.getCurrentTrajectory();
+                    if (!curTraj.empty()) {
+                        std::vector<Point3D> curRing;
+                        curRing.reserve(curTraj.size());
+                        // === Apply gradual Z rise if enabled ===
+			double zTopBase = currentZ; // now respects global cumulative Z
+			double zDynamic = zTopBase;
+			if (gradualZ && zStepIndex < Z_STEPS_PER_ITER) {
+			    zDynamic += zStepIndex * Z_STEP_UNITS;
+			}
+			for (const auto &p : curTraj) {
+			    double zValue = zDynamic;
+			    curRing.emplace_back(p.x, p.y, zValue);
+			    if (gradualZ && zStepIndex < Z_STEPS_PER_ITER) zStepIndex++;
+			}
+                        toSend.push_back(std::move(curRing));
+                    }
+
+
+                    // copy of toSend is already local; release lock (we are inside lock already in your code snippet)
+                    // so instead of calling sendPath3D under ilcMutex, spawn a thread:
+                    if (!toSend.empty()) {
+                        std::thread sender([toSend]() mutable {
+                            // attempt to ensure connection before sending; rendererClient is thread-safe via its mutex
+                            // keep a couple retries if disconnected
+                            for (int attempt = 0; attempt < 2; ++attempt) {
+                                if (rendererClient.isConnected() || rendererClient.connectToRenderer("127.0.0.1", RENDERER_PORT)) {
+                                    rendererClient.sendPath3D(toSend);
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
+                        });
+                        sender.detach();
+
+                        // update lastSentLayerCount only for fully completed layers (not for currentTrajectory)
+                        lastSentLayerCount = completed.size();
+                    }
+
+                    // Write G-code only for newly completed layers (not current in-progress ring)
+                    if (!completed.empty() && gcodeFile.is_open()) {
+                        for (size_t li = lastSentLayerCount; li < completed.size(); ++li) {
+                            std::vector<Point3D> layer3d;
+                            layer3d.reserve(completed[li].size());
+                            double z = li * layerHeight;
+                            for (const auto &p : completed[li]) layer3d.emplace_back(p.x, p.y, z);
+                            writeGCodeForPath(layer3d, gcodeFile);
+                        }
+                    }
+                }
+            }
+
+            // 2D rendering
+
+            // ----- poll X events for simple 2D zoom control (mouse wheel + keyboard) -----
+            {
+                Display* dpy = viz.getDisplay();
+                while (XPending(dpy) > 0) {
+                    XEvent ev;
+                    XNextEvent(dpy, &ev);
+                    if (ev.type == ButtonPress) {
+                        XButtonEvent be = ev.xbutton;
+                        // mouse wheel: button 4 = up, 5 = down
+                        if (be.button == 4) {
+                            // wheel up -> zoom in (factor >1)
+                            applyZoom2D(1.15, &ilc.getBaseCrossSection());
+                        } else if (be.button == 5) {
+                            // wheel down -> zoom out
+                            applyZoom2D(1.0/1.15, &ilc.getBaseCrossSection());
+                        }
+                    } else if (ev.type == KeyPress) {
+                        KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                        if (ks == XK_plus || ks == XK_equal) {
+                            applyZoom2D(1.15, &ilc.getBaseCrossSection());
+                        } else if (ks == XK_minus || ks == XK_underscore) {
+                            applyZoom2D(1.0/1.15, &ilc.getBaseCrossSection());
+                        } else if (ks == XK_r || ks == XK_R) {
+                            // reset 2D zoom/view to current reference
+                            resetZoom2DToShape(ilc.getBaseCrossSection());
+                        }
+                    }
+                    // ignore other events
+                }
+            }
+            // ----- end X event polling -----
+
+            // 2D rendering (throttled to ~30 FPS to avoid X11 flashing)
+            static auto lastDraw = std::chrono::steady_clock::now();
+            auto nowDraw = std::chrono::steady_clock::now();
+            auto msSince = std::chrono::duration_cast<std::chrono::milliseconds>(nowDraw - lastDraw).count();
+            if (msSince >= 33) { // ~30 FPS
+                lastDraw = nowDraw;
+
+                viz.clear();
+                viz.drawGrid();
+
+                {
+                    std::lock_guard<std::mutex> lock(ilcMutex);
+
+                    viz.drawPath(ilc.getReference(), 1, 3, true); // reference always blue (colorIdx 1)
+
+                    const auto& completed = ilc.getCompletedPaths();
+                    for (const auto& path : completed) {
+                        int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawPath(path, colorIdx, 2, true);
+                    }
+
+                    if (ilc.getCurrentTrajectory().size() > 2) {
+                        int colorIdx = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawPath(ilc.getCurrentTrajectory(), colorIdx, 3, false);
+                    }
+
+                    if (isRunning) {
+                        int robotColor = (ilc.getErrorLevel() > 0) ? 2 : 1;
+                        viz.drawRobot(robotPos, robotColor, 10);
+                    }
+
+                    std::ostringstream ss;
+                    ss << "Iteration: " << ilc.getIteration()
+                       << " | RMS Error: " << std::fixed << std::setprecision(4) << ilc.getRMSError()
+                       << " | Error Level: " << (int)(ilc.getErrorLevel() * 100) << "%";
+                    viz.drawText(20, 30, ss.str());
+                }
+
+                viz.flush();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return 0;
+}
+

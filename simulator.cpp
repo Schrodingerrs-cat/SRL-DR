@@ -1,5 +1,4 @@
 // simulator.cpp
-// (FULL FILE — updated per your requests: 2D blue path, realtime RMS, smoother morph -> ILC-like transition)
 
 #include <arpa/inet.h>   // inet_addr
 #include <sys/types.h>
@@ -303,7 +302,7 @@ static void updateWorldBounds(const std::vector<Point2D>& shape) {
     WORLD_MIN_Y = miny - paddy;
     WORLD_MAX_Y = maxy + paddy;
 
-    std::cout << "[2D View] Updated world bounds: X[" 
+    std::cout << "[2D View] Updated world bounds: X["
               << WORLD_MIN_X << ", " << WORLD_MAX_X
               << "] Y[" << WORLD_MIN_Y << ", " << WORLD_MAX_Y << "]\n";
 }
@@ -383,8 +382,8 @@ private:
     double morphSmoothingMultiplier = 1.0;     // multiply smoothingAlpha for morph-driven corrections
 
 public:
-    ILCController(int nPts, double lr) 
-        : numPoints(nPts), learningRate(lr), systemErrorLevel(0.0), 
+    ILCController(int nPts, double lr)
+        : numPoints(nPts), learningRate(lr), systemErrorLevel(0.0),
           iteration(0), enableNoise(false), smoothingAlpha(0.3), lastRMSError(0.0) {
         corrections.assign(numPoints, Point3D(0, 0, 0));
         reference = ShapeGenerator::generateCircle(numPoints);
@@ -661,7 +660,7 @@ public:
         currentTrajectory.clear();
 
         if (iteration > 1) {
-            std::cout << "[ILC] Adapting to possibly new reference — RMS Error now: " 
+            std::cout << "[ILC] Adapting to possibly new reference — RMS Error now: "
                       << lastRMSError << std::endl;
         }
         return rmsError;
@@ -1021,8 +1020,8 @@ private:
     std::mutex* ilcMutex;
 
 public:
-    CommandServer(ILCController* ilcPtr, std::atomic<bool>* runFlag, std::mutex* mtx) 
-        : serverFd(-1), clientFd(-1), running(false), ilc(ilcPtr), 
+    CommandServer(ILCController* ilcPtr, std::atomic<bool>* runFlag, std::mutex* mtx)
+        : serverFd(-1), clientFd(-1), running(false), ilc(ilcPtr),
           isSimRunning(runFlag), ilcMutex(mtx) {}
 
     ~CommandServer() {
@@ -1590,4 +1589,3 @@ int main() {
     }
     return 0;
 }
-
