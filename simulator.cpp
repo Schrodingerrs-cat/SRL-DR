@@ -356,6 +356,10 @@ private:
     int iteration;
     bool enableNoise;
     double smoothingAlpha;  // Smoothing factor for gradual correction
+    // --- new: track initial dome separation and allow freezing/decay of corrections
+    double initialDomeSeparation = 0.0;
+    bool freezeCorrections = false;
+
 
     std::vector<Point2D> reference;
     std::vector<Point3D> corrections;
@@ -413,10 +417,18 @@ public:
     void startDomeToTarget(const std::vector<Point2D>& target) {
         if (target.empty()) return;
         domeTarget = target;
-        // ensure domeTarget has same point count as reference
         if (domeTarget.size() != (size_t)numPoints) domeTarget.resize(numPoints, domeTarget.back());
+        // compute initial separation so we can measure fractional collapse
+        double maxDist = 0.0;
+        for (int i = 0; i < numPoints; ++i) {
+            double dx = domeTarget[i].x - reference[i].x;
+            double dy = domeTarget[i].y - reference[i].y;
+            maxDist = std::max(maxDist, std::sqrt(dx*dx + dy*dy));
+        }
+        initialDomeSeparation = std::max(1e-8, maxDist);
         domeActive = true;
-        std::cout << "[ILC] Dome mode started (adaptive convergence)\n";
+        freezeCorrections = false;
+        std::cout << "[ILC] Dome mode started (adaptive convergence), initialSep=" << initialDomeSeparation << "\n";
     }
 
     void stopDome() {
@@ -557,22 +569,43 @@ public:
         double rmsError = std::sqrt(totalError / numPoints);
         lastRMSError = rmsError;
 
-        // Standard ILC update with smoothing for gradual correction
-        for (int i = 0; i < numPoints && i < (int)trackingErrors.size(); i++) {
-            double proposedDeltaX = learningRate * trackingErrors[i].x;
-            double proposedDeltaY = learningRate * trackingErrors[i].y;
-
-            corrections[i].x += smoothingAlpha * proposedDeltaX;
-            corrections[i].y += smoothingAlpha * proposedDeltaY;
-            corrections[i].z += smoothingAlpha * 0.0; // placeholder for Z correction (optional)
-
-            double correctionMag = std::sqrt(corrections[i].x * corrections[i].x +
-                                            corrections[i].y * corrections[i].y);
-            if (correctionMag > 1.0) {
-                corrections[i].x = (corrections[i].x / correctionMag) * 1.0;
-                corrections[i].y = (corrections[i].y / correctionMag) * 1.0;
+        // If corrections frozen (e.g. dome collapsed), skip the correction update step
+        if (freezeCorrections) {
+            std::cout << "[ILC] Corrections frozen; skipping update this iteration.\n";
+        } else {
+            // existing correction update loop (unchanged)
+            for (int i = 0; i < numPoints && i < (int)trackingErrors.size(); i++) {
+                double proposedDeltaX = learningRate * trackingErrors[i].x;
+                double proposedDeltaY = learningRate * trackingErrors[i].y;
+                corrections[i].x += smoothingAlpha * proposedDeltaX;
+                corrections[i].y += smoothingAlpha * proposedDeltaY;
+                corrections[i].z += smoothingAlpha * 0.0;
+                double correctionMag = std::sqrt(corrections[i].x * corrections[i].x +
+                                                corrections[i].y * corrections[i].y);
+                if (correctionMag > 1.0) {
+                    corrections[i].x = (corrections[i].x / correctionMag) * 1.0;
+                    corrections[i].y = (corrections[i].y / correctionMag) * 1.0;
+                }
             }
         }
+
+        // Standard ILC update with smoothing for gradual correction
+        // for (int i = 0; i < numPoints && i < (int)trackingErrors.size(); i++) {
+        //     double proposedDeltaX = learningRate * trackingErrors[i].x;
+        //     double proposedDeltaY = learningRate * trackingErrors[i].y;
+        //     // --- PATCH: reduce correction intensity during dome/morph ---
+        //     double damping = (domeActive || morphActive) ? 0.3 : 1.0;
+        //     corrections[i].x += smoothingAlpha * proposedDeltaX;
+        //     corrections[i].y += smoothingAlpha * proposedDeltaY;
+        //     corrections[i].z += smoothingAlpha * 0.0; // placeholder for Z correction (optional)
+
+        //     double correctionMag = std::sqrt(corrections[i].x * corrections[i].x +
+        //                                     corrections[i].y * corrections[i].y);
+        //     if (correctionMag > 1.0) {
+        //         corrections[i].x = (corrections[i].x / correctionMag) * 1.0;
+        //         corrections[i].y = (corrections[i].y / correctionMag) * 1.0;
+        //     }
+        // }
 
         iteration++;
         lastErrors = trackingErrors;
@@ -621,32 +654,55 @@ public:
         }
 
         // --- If dome mode is active, morph the reference gradually toward domeTarget ---
+        // --- If dome mode is active, adaptively converge toward domeTarget ---
         if (domeActive && !domeTarget.empty()) {
-            // compute max distance to target
-            double maxDist = 0.0;
+            // geometric helper
+            auto boundingRadius = [](const std::vector<Point2D>& s) {
+                Point2D c = ShapeGenerator::computeCentroid(s);
+                double rmax = 0.0;
+                for (auto &p : s) rmax = std::max(rmax, std::hypot(p.x - c.x, p.y - c.y));
+                return rmax;
+            };
+
+            double rNow = boundingRadius(reference);
+            double rTarget = boundingRadius(domeTarget);
+
+            // measure difference statistics
+            double maxDist = 0.0, meanDist = 0.0;
             for (int i = 0; i < numPoints; ++i) {
                 double dx = domeTarget[i].x - reference[i].x;
                 double dy = domeTarget[i].y - reference[i].y;
-                double d = std::sqrt(dx*dx + dy*dy);
+                double d = std::hypot(dx, dy);
+                meanDist += d;
                 maxDist = std::max(maxDist, d);
             }
+            meanDist /= numPoints;
 
-            if (maxDist <= domeEpsilon) {
+            // compute how much of the shape difference remains relative to original
+            double fracRemaining = initialDomeSeparation > 1e-8 ? (meanDist / initialDomeSeparation) : 0.0;
+
+            // stop when the dome shape’s dimensions stop changing significantly
+            if (fracRemaining < 0.05 || maxDist < domeEpsilon) {
                 domeActive = false;
-                std::cout << "[ILC] Dome target reached (maxDist=" << maxDist << ") — dome mode off\n";
+                freezeCorrections = true; // prevent jitter after done
+                std::cout << "[ILC] Dome convergence complete (remaining=" << fracRemaining
+                          << ", maxDist=" << maxDist << ")\n";
             } else {
-                // morph amount scales with learningRate and last RMS error so it slows if converged
-                double step = std::min(0.5, std::max(0.02, learningRate * smoothingAlpha));
-                // move reference points toward domeTarget by a smoothstep of step
+                // adaptive step: slower as we approach convergence
+                double stepScale = std::clamp(fracRemaining * 0.8, 0.02, 0.25);
+                double step = learningRate * smoothingAlpha * stepScale;
+
                 for (int i = 0; i < numPoints; ++i) {
-                    reference[i].x = reference[i].x + step * (domeTarget[i].x - reference[i].x);
-                    reference[i].y = reference[i].y + step * (domeTarget[i].y - reference[i].y);
+                    reference[i].x += step * (domeTarget[i].x - reference[i].x);
+                    reference[i].y += step * (domeTarget[i].y - reference[i].y);
                 }
-                // update bounds for visualization
+
                 updateWorldBounds(reference);
-                std::cout << "[ILC] Dome morph step applied (maxDist=" << maxDist << ", step=" << step << ")\n";
+                std::cout << "[ILC] Dome morph step applied (fracRemaining=" << fracRemaining
+                          << ", step=" << step << ")\n";
             }
         }
+
 
         std::cout << "[ILC] Iteration " << iteration-1 << " RMS Error: " << rmsError << std::endl;
 
@@ -686,6 +742,28 @@ public:
         enableNoise = enabled;
         std::cout << "[ILC] Noise " << (enabled ? "enabled" : "disabled") << std::endl;
     }
+
+    // Immediately set new reference (used at runtime when user requests an instant ref change).
+    // This does NOT reset the corrections vector (so ILC can continue adapting), but it updates world bounds.
+    void setReferenceImmediate(const std::vector<Point2D>& ref) {
+        if (ref.empty()) return;
+        reference = ref;
+        if (reference.size() != (size_t)numPoints) reference.resize(numPoints, reference.back());
+        updateWorldBounds(reference);
+        std::cout << "[ILC] Reference replaced IMMEDIATELY (ILC will adapt corrections)\n";
+    }
+
+    // Multiply existing correction map by a decay factor in (0,1] to reduce abrupt offset after ref jump.
+    void decayCorrections(double factor) {
+        factor = std::max(0.0, std::min(1.0, factor));
+        for (int i = 0; i < numPoints; ++i) {
+            corrections[i].x *= factor;
+            corrections[i].y *= factor;
+            corrections[i].z *= factor;
+        }
+        std::cout << "[ILC] Corrections decayed by factor " << factor << "\n";
+    }
+
 
     void reset() {
         corrections.assign(numPoints, Point3D(0, 0, 0));
@@ -1222,7 +1300,11 @@ private:
             writeGCodeForPath(flattenRingsToPath(morphRings), std::string("morph_transition.gcode"));
 
             // Start the ILC gradual morph (ILC will update reference over iterations)
-            ilc->startMorphTo(newRef, 0.06);
+            //ilc->startMorphTo(newRef, 0.06);
+            // Immediately replace the reference (green outline jumps) but let ILC adapt corrections gradually.
+            // Decay prior corrections to avoid jerk.
+            ilc->setReferenceImmediate(newRef);
+            ilc->decayCorrections(0.5); // reduce old correction influence; tweak [0.0..1.0]
             std::cout << "[COMMAND] Starting runtime morph to new shape\n";
             return "OK: Reference will morph to " + shapeType + " — ILC adapting online\n";
         }
