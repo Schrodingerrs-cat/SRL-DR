@@ -16,29 +16,29 @@ A comprehensive C++ implementation of Iterative Learning Control (ILC) for traje
 ## Key Features
 
 ### Core ILC Functionality
-✅ **Adaptive ILC** with smooth reference tracking  
-✅ Dynamic reference morphing during runtime (shape-to-shape transitions)  
-✅ Automatic correction decay for smooth shape changes  
-✅ Multi-harmonic systematic error modeling  
-✅ Configurable learning rate and smoothing parameters  
-✅ Real-time RMS error monitoring  
+✅ **Adaptive ILC** with smooth reference tracking
+✅ Dynamic reference morphing during runtime (shape-to-shape transitions)
+✅ Automatic correction decay for smooth shape changes
+✅ Multi-harmonic systematic error modeling
+✅ Configurable learning rate and smoothing parameters
+✅ Real-time RMS error monitoring
 
 ### Advanced 3D Capabilities
-✅ **Dome Construction** - Adaptive convergence to target shapes with automatic stopping  
-✅ **Shape Morphing** - Smooth online transitions between geometries  
-✅ **Layer Stacking** - Vertical offset management for 3D structures  
-✅ **G-code Export** - Continuous append to `ilc_path_combined.gcode`  
-✅ **3D Visualization** - Real-time mesh rendering with rotation, zoom, and pan  
+✅ **Dome Construction** - Adaptive convergence to target shapes with automatic stopping
+✅ **Shape Morphing** - Smooth online transitions between geometries
+✅ **Layer Stacking** - Vertical offset management for 3D structures
+✅ **G-code Export** - Continuous append to `ilc_path_combined.gcode`
+✅ **3D Visualization** - Real-time mesh rendering with rotation, zoom, and pan
 
 ### Dynamic Visualization
-✅ **2D View (X11)** - Mouse wheel zoom, grid display, path ghosting  
-✅ **3D View (OpenGL)** - Interactive camera controls, layered mesh display  
-✅ **Dual rendering** - Synchronized 2D cross-section and 3D build visualization  
-✅ **Auto-scaling bounds** - Viewport adapts to current shape dimensions  
+✅ **2D View (X11)** - Mouse wheel zoom, grid display, path ghosting
+✅ **3D View (OpenGL)** - Interactive camera controls, layered mesh display
+✅ **Dual rendering** - Synchronized 2D cross-section and 3D build visualization
+✅ **Auto-scaling bounds** - Viewport adapts to current shape dimensions
 
 ### Preset Scenarios
-✅ Drift, lag, deform, and noise disturbance profiles  
-✅ One-command setup for testing convergence behavior  
+✅ Drift, lag, deform, and noise disturbance profiles
+✅ One-command setup for testing convergence behavior
 
 ## Installation
 
@@ -638,7 +638,7 @@ ilc> dome circle 0.2
 // In simulator.cpp
 const int NUM_POINTS = 100;  // Reduce for faster updates
 
-// Reduce 2D render frequency (line ~2800)
+// Reduce 2D render frequency
 if (msSince >= 50) { // 20 FPS instead of 30
 
 // Batch G-code writes
@@ -693,7 +693,7 @@ pkill ilc_simulator
 
 **Jerky 2D rendering**
 ```bash
-# Increase render interval (line ~2800 in simulator.cpp)
+# Increase render interval
 if (msSince >= 50) { // Reduce from 33ms to 50ms
 ```
 
@@ -751,7 +751,7 @@ static std::vector<Point2D> generateHeart(int numPoints, double scale = 1.0) {
 }
 ```
 
-Register in command handler (~line 1800):
+Register in command handler:
 ```cpp
 else if (shapeType == "heart") {
     double scale = 1.0;
@@ -768,7 +768,7 @@ std::cout << "                             Example: shape heart 1.2\n";
 
 ### Tune Plant Dynamics
 
-Edit `plantModel()` method (~line 600):
+Edit `plantModel()` method:
 
 ```cpp
 // Add 4th harmonic distortion
@@ -785,7 +785,7 @@ double phaseError = systemErrorLevel * (0.25 + 0.03 * std::sin(0.5 * theta + ite
 
 ### Custom Layer Height
 
-Change default stacking offset (~line 17):
+Change default stacking offset:
 ```cpp
 static constexpr double DEFAULT_LAYER_HEIGHT = 0.05; // Finer layers
 ```
