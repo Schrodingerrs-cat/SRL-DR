@@ -891,6 +891,11 @@ f(k) = ||r_k - r_target|| / ||r_0 - r_target||
 - Automatic stopping at 5% threshold
 - Geometric convergence rate (exponential approach)
 
+## Video Implementation
+
+You can find the video implementation here in this playlist:
+[ILC 3D Printer Simulator - Video Tutorials](https://www.youtube.com/playlist?list=PLjOq_2Ap5hLZfs79zW1JtutaKBr80EMHk)
+
 ## Citing This Work
 
 ```bibtex
@@ -909,9 +914,7 @@ f(k) = ||r_k - r_target|| / ||r_0 - r_target||
 - [ ] Multi-extruder support (IDEX systems)
 - [ ] Temperature-dependent error modeling
 - [ ] Real-time slicing integration
-- [ ] Machine learning error prediction
-- [ ] Raspberry Pi port for on-printer execution
-- [ ] Web-based 3D viewer (WebGL)
+- [ ] On-printer execution
 - [ ] CSV data export for analysis
 - [ ] Automated convergence plots
 
