@@ -1,4 +1,4 @@
-# ILC Real-Time 3D Printer Simulator - Advanced C++ Implementation
+# ILC Real-Time 3D Printer Simulator 
 
 A comprehensive C++ implementation of Iterative Learning Control (ILC) for trajectory tracking with real-time 2D/3D visualization, dynamic shape morphing, dome construction, and G-code generation for 3D printing applications.
 
@@ -891,14 +891,19 @@ f(k) = ||r_k - r_target|| / ||r_0 - r_target||
 - Automatic stopping at 5% threshold
 - Geometric convergence rate (exponential approach)
 
+## Video Implementation
+
+You can find the video implementation here in this playlist:
+[ILC 3D Printer Simulator - Video Tutorials](https://www.youtube.com/playlist?list=PLjOq_2Ap5hLZfs79zW1JtutaKBr80EMHk)
+
 ## Citing This Work
 
 ```bibtex
 @software{ilc_3d_printer_simulator,
   title={ILC 3D Printer Simulator: Adaptive Learning Control with Dynamic Shape Morphing},
-  author={Your Name},
+  author={Aryan Shah},
   year={2025},
-  url={https://github.com/yourusername/ilc-simulator},
+  url={[https://github.com/yourusername/ilc-simulator](https://github.com/Schrodingerrs-cat/SRL-DR)},
   note={C++ implementation with OpenGL 3D visualization and G-code generation}
 }
 ```
@@ -909,9 +914,7 @@ f(k) = ||r_k - r_target|| / ||r_0 - r_target||
 - [ ] Multi-extruder support (IDEX systems)
 - [ ] Temperature-dependent error modeling
 - [ ] Real-time slicing integration
-- [ ] Machine learning error prediction
-- [ ] Raspberry Pi port for on-printer execution
-- [ ] Web-based 3D viewer (WebGL)
+- [ ] On-printer execution
 - [ ] CSV data export for analysis
 - [ ] Automated convergence plots
 
@@ -926,7 +929,3 @@ MIT License - Free for research, educational, and commercial use.
 - **Issues**: Open GitHub issue with logs and screenshots
 - **Questions**: Discussion board or email maintainer
 - **Contributions**: Pull requests welcome (see CONTRIBUTING.md)
-
----
-
-**Happy Learning & Printing!** 🤖📈🖨️
