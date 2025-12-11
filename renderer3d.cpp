@@ -1,5 +1,5 @@
 // ============================================================================
-// ILC 3D RENDERER (OpenGL + TCP Listener) - FINAL FIXED VERSION
+// ILC 3D RENDERER (OpenGL + TCP Listener) - WITH BUILD ANIMATION MODES
 // ============================================================================
 #include <GL/glut.h>
 #include <sys/socket.h>
@@ -38,7 +38,6 @@ static void hsv2rgb(float h, float s, float v, float &r, float &g, float &b) {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -56,6 +55,7 @@ std::vector<Point3D> receiveBuffer;
 bool running = true;
 bool paused = false;
 
+// camera state
 float rotX = 25.0f, rotY = -45.0f;
 float zoom = 2.5f;
 float cameraTargetX = 0.0f, cameraTargetY = 0.0f, cameraTargetZ = 0.0f;
@@ -63,18 +63,26 @@ float cameraDistance = 2.5f;
 int lastX, lastY;
 bool dragging = false;
 
+// live cursor animation indices
 int drawRingIndex = 0;
 int drawVertexIndex = 0;
-// --- UI button positions and size ---
+
+// build animation mode
+enum RenderMode { MODE_LIVE = 0, MODE_BUILD = 1 };
+RenderMode renderMode = MODE_LIVE;
+int buildRingIndex = -1;       // index of last visible layer in build mode
+int buildFrameCounter = 0;     // frames spent on current layer
+int framesPerLayer = 8;        // smaller means faster build
+
+// UI button positions and size
 struct Button { float x1, y1, x2, y2; std::string label; };
 std::vector<Button> buttons;
 
 // Window size tracker
 int winW = 900, winH = 700;
 
-
 // ---------------------------------------------------------------------------
-// Recompute View (proper position!)
+// Recompute View
 // ---------------------------------------------------------------------------
 void recomputeView() {
     std::lock_guard<std::mutex> lk(dataMutex);
@@ -83,7 +91,7 @@ void recomputeView() {
     float minx = 1e9f, miny = 1e9f, minz = 1e9f;
     float maxx = -1e9f, maxy = -1e9f, maxz = -1e9f;
 
-    for (auto &r : pathRings)
+    for (auto &r : pathRings) {
         for (auto &p : r) {
             minx = std::min(minx, p.x);
             maxx = std::max(maxx, p.x);
@@ -92,6 +100,7 @@ void recomputeView() {
             minz = std::min(minz, p.z);
             maxz = std::max(maxz, p.z);
         }
+    }
 
     float cx = 0.5f * (minx + maxx);
     float cy = 0.5f * (miny + maxy);
@@ -108,13 +117,12 @@ void recomputeView() {
     cameraDistance = span * 1.5f;
 }
 
-// Safe, clamped zoom helper (call from UI handlers)
+// Safe, clamped zoom helper
 inline void applyZoomDelta(float delta) {
     zoom += delta;
     if (zoom < 0.2f) zoom = 0.2f;
     if (zoom > 50.0f) zoom = 50.0f;
 }
-
 
 // ---------------------------------------------------------------------------
 // TCP SERVER THREAD
@@ -147,7 +155,7 @@ void serverThreadFunc() {
         int client = accept(server_fd, nullptr, nullptr);
         if (client < 0) continue;
 
-        std::cout << "[Renderer3D] Simulator connected\n";
+        std::cout << "[Renderer3D] Simulator connected" << std::endl;
 
         std::string buffer;
         char buf[2048];
@@ -163,7 +171,8 @@ void serverThreadFunc() {
                 buffer.erase(0, pos + 1);
 
                 line.erase(0, line.find_first_not_of(" \t\r\n"));
-                line.erase(line.find_last_not_of(" \t\r\n") + 1);
+                if (!line.empty() && line.find_last_not_of(" \t\r\n") != std::string::npos)
+                    line.erase(line.find_last_not_of(" \t\r\n") + 1);
                 if (line.empty()) continue;
 
                 if (line.rfind("BEGIN_PATH", 0) == 0) {
@@ -181,7 +190,7 @@ void serverThreadFunc() {
                     receiveExpectedPoints = totalPts;
 
                     std::cout << "[Renderer3D] BEGIN_PATH: expecting " << totalPts
-                              << " points (" << ringSize << " per ring)\n";
+                              << " points (" << ringSize << " per ring)" << std::endl;
                 }
                 else if (line.rfind("END_PATH", 0) == 0) {
                     {
@@ -189,14 +198,17 @@ void serverThreadFunc() {
                         if (!receiveBuffer.empty())
                             pathRings.push_back(receiveBuffer);
 
-                        std::cout << "[Renderer3D] END_PATH — rings: " << pathRings.size() << "\n";
+                        std::cout << "[Renderer3D] END_PATH — rings: "
+                                  << pathRings.size() << std::endl;
 
                         drawRingIndex = 0;
                         drawVertexIndex = 0;
+                        buildRingIndex = -1;
+                        buildFrameCounter = 0;
                     }
 
                     static int redrawCounter = 0;
-                    if (++redrawCounter % 3 == 0) { // update every 3 paths
+                    if (++redrawCounter % 3 == 0) {
                         recomputeView();
                         glutPostRedisplay();
                     }
@@ -210,14 +222,17 @@ void serverThreadFunc() {
                     receivedCount = 0;
                     drawRingIndex = 0;
                     drawVertexIndex = 0;
+                    buildRingIndex = -1;
+                    buildFrameCounter = 0;
 
-                    // reset view parameters to defaults
                     cameraTargetX = cameraTargetY = cameraTargetZ = 0.0f;
-                    rotX = 25.0f; rotY = -45.0f;
+                    rotX = 25.0f;
+                    rotY = -45.0f;
                     zoom = cameraDistance = 2.5f;
 
-                    recomputeView(); // safe: already acquires dataMutex internally, but we hold it — OK
-                    std::cout << "[Renderer3D] Received RESET_VIEW — cleared view\n";
+                    recomputeView();
+                    std::cout << "[Renderer3D] Received RESET_VIEW — cleared view"
+                              << std::endl;
                     glutPostRedisplay();
                 }
                 else {
@@ -228,7 +243,8 @@ void serverThreadFunc() {
                         receiveBuffer.push_back({x, y, z});
                         receivedCount++;
 
-                        if (currentReceiveRingSize > 0 && (int)receiveBuffer.size() >= currentReceiveRingSize) {
+                        if (currentReceiveRingSize > 0 &&
+                            (int)receiveBuffer.size() >= currentReceiveRingSize) {
                             pathRings.push_back(receiveBuffer);
                             receiveBuffer.clear();
                         }
@@ -237,7 +253,7 @@ void serverThreadFunc() {
             }
         }
 
-        std::cout << "[Renderer3D] Simulator disconnected\n";
+        std::cout << "[Renderer3D] Simulator disconnected" << std::endl;
         close(client);
     }
 
@@ -260,38 +276,45 @@ void drawFilledMesh() {
     std::lock_guard<std::mutex> lk(dataMutex);
     if (pathRings.size() < 1) return;
 
-    const float baseR = 0.36f; // greyish-blue base color (#5c708a)
+    const float baseR = 0.36f;
     const float baseG = 0.44f;
     const float baseB = 0.54f;
 
-    for (size_t r = 0; r + 1 < pathRings.size(); ++r) {
+    size_t ringsToDraw = pathRings.size();
+    if (renderMode == MODE_BUILD) {
+        if (buildRingIndex < 0) {
+            return; // nothing built yet
+        }
+        ringsToDraw = std::min(ringsToDraw,
+                               static_cast<size_t>(buildRingIndex + 1));
+    }
+
+    for (size_t r = 0; r + 1 < ringsToDraw; ++r) {
         const auto &A = pathRings[r];
         const auto &B = pathRings[r + 1];
         int N = std::min(A.size(), B.size());
         if (N < 2) continue;
 
-        // soft gradient fade by height
-        float fade = static_cast<float>(r) / std::max((int)pathRings.size() - 1, 1);
+        float fade = static_cast<float>(r) /
+                     std::max((int)pathRings.size() - 1, 1);
         float R = baseR * (1.0f - 0.3f * fade);
         float G = baseG * (1.0f - 0.3f * fade);
-        float Bb = baseB * (1.0f - 0.3f * fade);  // renamed from B → Bb
+        float Bb = baseB * (1.0f - 0.3f * fade);
 
         glColor3f(R, G, Bb);
         glLineWidth(LINE_WIDTH);
 
-        // ring outline
         glBegin(GL_LINE_STRIP);
         for (int i = 0; i < N; ++i)
             glVertex3f(A[i].x, A[i].y, A[i].z);
         glVertex3f(A[0].x, A[0].y, A[0].z);
         glEnd();
 
-        // filled strip between layers with subtle shade difference
         glBegin(GL_TRIANGLE_STRIP);
         for (int i = 0; i < N; ++i) {
             glColor3f(R, G, Bb);
             glVertex3f(A[i].x, A[i].y, A[i].z);
-            glColor3f(R * 0.9f, G * 0.9f, Bb * 0.9f); // slight gradient
+            glColor3f(R * 0.9f, G * 0.9f, Bb * 0.9f);
             glVertex3f(B[i].x, B[i].y, B[i].z);
         }
         glVertex3f(A[0].x, A[0].y, A[0].z);
@@ -299,18 +322,19 @@ void drawFilledMesh() {
         glEnd();
     }
 
-    // cursor point
-    if (drawRingIndex < (int)pathRings.size()) {
+    // cursor point (only meaningful in live mode)
+    if (renderMode == MODE_LIVE && drawRingIndex < (int)pathRings.size()) {
         const auto &r = pathRings[drawRingIndex];
-        int idx = std::min(drawVertexIndex, (int)r.size() - 1);
-        glPointSize(POINT_SIZE * 2.0f);
-        glColor3f(1.0f, 1.0f, 0.0f);
-        glBegin(GL_POINTS);
-        glVertex3f(r[idx].x, r[idx].y, r[idx].z);
-        glEnd();
+        if (!r.empty()) {
+            int idx = std::min(drawVertexIndex, (int)r.size() - 1);
+            glPointSize(POINT_SIZE * 2.0f);
+            glColor3f(1.0f, 1.0f, 0.0f);
+            glBegin(GL_POINTS);
+            glVertex3f(r[idx].x, r[idx].y, r[idx].z);
+            glEnd();
+        }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Overlay Buttons (Zoom UI)
@@ -326,7 +350,7 @@ void drawButtons2D() {
     glLoadIdentity();
 
     for (const auto &b : buttons) {
-        // draw button background
+        // background
         glColor3f(0.15f, 0.15f, 0.2f);
         glBegin(GL_QUADS);
         glVertex2f(b.x1, b.y1);
@@ -344,7 +368,7 @@ void drawButtons2D() {
         glVertex2f(b.x1, b.y2);
         glEnd();
 
-        // text
+        // label
         glColor3f(1, 1, 1);
         glRasterPos2f(b.x1 + 12, b.y1 + 8);
         for (char c : b.label)
@@ -356,7 +380,6 @@ void drawButtons2D() {
     glPopMatrix();
     glMatrixMode(GL_MODELVIEW);
 }
-
 
 // ---------------------------------------------------------------------------
 // GLUT callbacks
@@ -381,13 +404,27 @@ void idle() {
     if (!paused) {
         std::lock_guard<std::mutex> lk(dataMutex);
         if (!pathRings.empty()) {
-            int ringCount = (int)pathRings.size();
-            if (drawRingIndex < ringCount) {
-                int ringSize = (int)pathRings[drawRingIndex].size();
-                drawVertexIndex += 3;
-                if (drawVertexIndex >= ringSize) {
+            if (renderMode == MODE_LIVE) {
+                int ringCount = (int)pathRings.size();
+                if (drawRingIndex < ringCount) {
+                    int ringSize = (int)pathRings[drawRingIndex].size();
+                    drawVertexIndex += 3;
+                    if (drawVertexIndex >= ringSize) {
+                        drawVertexIndex = 0;
+                        drawRingIndex++;
+                    }
+                } else {
+                    drawRingIndex = 0;
                     drawVertexIndex = 0;
-                    drawRingIndex++;
+                }
+            } else if (renderMode == MODE_BUILD) {
+                size_t totalRings = pathRings.size();
+                if (buildRingIndex < (int)totalRings - 1) {
+                    buildFrameCounter++;
+                    if (buildFrameCounter >= framesPerLayer) {
+                        buildRingIndex++;
+                        buildFrameCounter = 0;
+                    }
                 }
             }
         }
@@ -396,35 +433,33 @@ void idle() {
 }
 
 void reshape(int w, int h) {
-    winW = w; winH = h; // store for UI overlay
+    winW = w;
+    winH = h;
 
-    glViewport(0,0,w,h);
+    glViewport(0, 0, w, h);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluPerspective(60.0, (float)w/h, 0.1, 100.0);
+    gluPerspective(60.0, (float)w / (float)h, 0.1, 100.0);
 
-    // update button positions
-    float bw = 40, bh = 30, pad = 10;
+    float bw = 40.0f, bh = 30.0f, pad = 10.0f;
     buttons.clear();
-    buttons.push_back({w - 2*bw - 2*pad, pad, w - bw - 2*pad, pad + bh, "-"}); // zoom out
-    buttons.push_back({w - bw - pad, pad, w - pad, pad + bh, "+"});             // zoom in
+    buttons.push_back({w - 2*bw - 2*pad, pad, w - bw - 2*pad, pad + bh, "-"});
+    buttons.push_back({w - bw - pad, pad, w - pad, pad + bh, "+"});
 }
 
 void mouse(int button, int state, int x, int y) {
     if (button == GLUT_LEFT_BUTTON && state == GLUT_DOWN) {
-        int yFlipped = winH - y; // flip coordinate for 2D overlay
+        int yFlipped = winH - y;
 
-        // check for button click
         for (const auto &b : buttons) {
             if (x >= b.x1 && x <= b.x2 && yFlipped >= b.y1 && yFlipped <= b.y2) {
-            if (b.label == "+") applyZoomDelta(-0.2f);
-            if (b.label == "-") applyZoomDelta(0.2f);
-            glutPostRedisplay();
-            return;
+                if (b.label == "+") applyZoomDelta(-0.2f);
+                if (b.label == "-") applyZoomDelta(0.2f);
+                glutPostRedisplay();
+                return;
             }
         }
 
-        // otherwise handle drag
         dragging = true;
         lastX = x;
         lastY = y;
@@ -434,7 +469,6 @@ void mouse(int button, int state, int x, int y) {
         dragging = false;
     }
 }
-
 
 void motion(int x, int y) {
     if (dragging) {
@@ -450,14 +484,36 @@ void keyboard(unsigned char key, int, int) {
         running = false;
         exit(0);
     }
-    if (key == ' ') paused = !paused;
-    if (key == '+' || key == '=') applyZoomDelta(-0.2f);
-    if (key == '-' || key == '_') applyZoomDelta(0.2f);
+    if (key == ' ') {
+        paused = !paused;
+    }
+    if (key == '+' || key == '=') {
+        applyZoomDelta(-0.2f);
+    }
+    if (key == '-' || key == '_') {
+        applyZoomDelta(0.2f);
+    }
     if (key == 'r' || key == 'R') {
         rotX = 25.0f;
         rotY = -45.0f;
         zoom = 2.5f;
-        std::cout << "[Renderer3D] View reset\n";
+        std::cout << "[Renderer3D] View reset" << std::endl;
+    }
+    if (key == 'l' || key == 'L') {
+        renderMode = MODE_LIVE;
+        drawRingIndex = 0;
+        drawVertexIndex = 0;
+        buildRingIndex = -1;
+        buildFrameCounter = 0;
+        std::cout << "[Renderer3D] Mode: LIVE (full mesh)" << std::endl;
+    }
+    if (key == 'g' || key == 'G') {
+        renderMode = MODE_BUILD;
+        buildRingIndex = -1;
+        buildFrameCounter = 0;
+        drawRingIndex = 0;
+        drawVertexIndex = 0;
+        std::cout << "[Renderer3D] Mode: BUILD (layer-by-layer)" << std::endl;
     }
 }
 
@@ -465,8 +521,9 @@ void keyboard(unsigned char key, int, int) {
 // MAIN
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::cout << "=== ILC 3D Renderer ===\n";
-    std::cout << "Controls: Mouse drag=rotate, +/-=zoom, space=pause, R=reset, ESC=exit\n";
+    std::cout << "=== ILC 3D Renderer ===" << std::endl;
+    std::cout << "Controls: Mouse drag=rotate, plus/minus=zoom, space=pause, R=reset, ESC=exit" << std::endl;
+    std::cout << "Modes: L=Live full model, G=Build animation (layer-by-layer)" << std::endl;
 
     std::thread(serverThreadFunc).detach();
 
@@ -475,16 +532,14 @@ int main(int argc, char** argv) {
     glutInitWindowSize(900, 700);
     glutCreateWindow("ILC 3D Printer Visualizer");
 
-    // ensure winW/winH reflect initial window dimensions before creating buttons
-    winW = 900; winH = 700;
+    winW = 900;
+    winH = 700;
 
-    // Define zoom UI buttons
-    float bw = 40, bh = 30, pad = 10;
+    float bw = 40.0f, bh = 30.0f, pad = 10.0f;
     buttons = {
         {winW - 2*bw - 2*pad, pad, winW - bw - 2*pad, pad + bh, "-"},
         {winW - bw - pad, pad, winW - pad, pad + bh, "+"}
     };
-
 
     glEnable(GL_DEPTH_TEST);
     glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
@@ -497,8 +552,8 @@ int main(int argc, char** argv) {
     glutMotionFunc(motion);
     glutKeyboardFunc(keyboard);
 
+    renderMode = MODE_LIVE;
+
     glutMainLoop();
     return 0;
 }
-
-
