@@ -1,4 +1,3 @@
-```markdown
 # ILC Real-Time Tracker  
 ### Iterative Learning Control with Spherical Dome Construction and STL Export
 
