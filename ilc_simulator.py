@@ -61,8 +61,8 @@ MIN_AREA_WORLD = MIN_AREA_MM2 / (MM_PER_WORLD**2)
 LAYER_DZ_WORLD = 0.05
 
 # History caps to avoid slowdown
-MAX_HISTORY = 100
-MAX_LAYER_HISTORY = 100
+MAX_HISTORY = 150
+MAX_LAYER_HISTORY = 150
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +160,122 @@ def _polyline_strip_triangles(
     return tris
 
 
+# ------------------------------
+# C2: HOLLOW SHELL, CONTINUOUS WALL IN Z
+# Side walls only, real thickness via outer+inner walls, no caps
+# ------------------------------
+def _offset_closed_path(points_xy: list[tuple[float, float]], half_w: float):
+    n = len(points_xy)
+    if n < 3:
+        return points_xy[:], points_xy[:]
+
+    def norm2(x, y):
+        L = math.hypot(x, y) or 1e-12
+        return x / L, y / L
+
+    outer = []
+    inner = []
+
+    for i in range(n):
+        x0, y0 = points_xy[(i - 1) % n]
+        x1, y1 = points_xy[i]
+        x2, y2 = points_xy[(i + 1) % n]
+
+        d1x, d1y = x1 - x0, y1 - y0
+        d2x, d2y = x2 - x1, y2 - y1
+
+        d1x, d1y = norm2(d1x, d1y)
+        d2x, d2y = norm2(d2x, d2y)
+
+        n1x, n1y = -d1y, d1x
+        n2x, n2y = -d2y, d2x
+
+        nx, ny = n1x + n2x, n1y + n2y
+        nx, ny = norm2(nx, ny)
+
+        outer.append((x1 + half_w * nx, y1 + half_w * ny))
+        inner.append((x1 - half_w * nx, y1 - half_w * ny))
+
+    return outer, inner
+
+
+def _connect_rings_quads(
+    ring0_xy: list[tuple[float, float]],
+    z0: float,
+    ring1_xy: list[tuple[float, float]],
+    z1: float,
+    flip: bool,
+):
+    tris = []
+    n = min(len(ring0_xy), len(ring1_xy))
+    if n < 3:
+        return tris
+
+    def add_quad(p0, p1, p2, p3):
+        if not flip:
+            tris.append((p0, p1, p2))
+            tris.append((p0, p2, p3))
+        else:
+            tris.append((p0, p2, p1))
+            tris.append((p0, p3, p2))
+
+    for i in range(n):
+        j = (i + 1) % n
+
+        a0 = (ring0_xy[i][0], ring0_xy[i][1], z0)
+        a1 = (ring0_xy[j][0], ring0_xy[j][1], z0)
+        b1 = (ring1_xy[j][0], ring1_xy[j][1], z1)
+        b0 = (ring1_xy[i][0], ring1_xy[i][1], z1)
+
+        add_quad(a0, a1, b1, b0)
+
+    return tris
+
+
+def _shell_walls_triangles_between_layers(
+    layers_xy: list[list[tuple[float, float]]],
+    layers_z: list[float],
+    line_w: float,
+) -> list[
+    tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+]:
+    tris = []
+    if len(layers_xy) < 2:
+        return tris
+
+    half_w = 0.5 * line_w
+
+    rings_outer = []
+    rings_inner = []
+    for pts in layers_xy:
+        if len(pts) < 3:
+            rings_outer.append(pts[:])
+            rings_inner.append(pts[:])
+            continue
+        outer, inner = _offset_closed_path(pts, half_w)
+        rings_outer.append(outer)
+        rings_inner.append(inner)
+
+    for k in range(len(layers_xy) - 1):
+        z0 = layers_z[k]
+        z1 = layers_z[k + 1]
+
+        o0, o1 = rings_outer[k], rings_outer[k + 1]
+        i0, i1 = rings_inner[k], rings_inner[k + 1]
+
+        if len(o0) >= 3 and len(o1) >= 3:
+            tris += _connect_rings_quads(o0, z0, o1, z1, flip=False)
+
+        if len(i0) >= 3 and len(i1) >= 3:
+            tris += _connect_rings_quads(i0, z0, i1, z1, flip=True)
+
+    return tris
+
+
 def export_trajectories_as_stl(
     ilc,
     out_path: str = "ilc_trajectories.stl",
@@ -186,11 +302,14 @@ def export_trajectories_as_stl(
     layer_z_world = ilc.get_completed_layers_z_world() or []
     dome_start_index = ilc.get_dome_start_index()
 
+    # Build per-layer XY + Z in mm, then connect layers to form continuous shell walls (C2)
+    layers_xy_mm: list[list[tuple[float, float]]] = []
+    layers_z_mm: list[float] = []
+
     for k, path in enumerate(completed):
-        if len(path) < 2:
+        if len(path) < 3:
             continue
 
-        # Map dome z only to layers at/after dome_start_index
         if layer_z_world and dome_start_index is not None and k >= dome_start_index:
             idx = k - dome_start_index
             if idx < len(layer_z_world):
@@ -200,14 +319,10 @@ def export_trajectories_as_stl(
         else:
             z_world = (k + 1) * dz
 
-        z_mm = w2mm(z_world)
-        layer_xy = [(w2mm(p.x), w2mm(p.y)) for p in path]
-        triangles += _polyline_strip_triangles(
-            layer_xy, z=z_mm, line_w=line_w_mm, thick=thick_mm
-        )
+        layers_z_mm.append(w2mm(z_world))
+        layers_xy_mm.append([(w2mm(p.x), w2mm(p.y)) for p in path])
 
-    if len(current) >= 2:
-        # For current (incomplete) path, use next layer height
+    if len(current) >= 3:
         if (
             layer_z_world
             and dome_start_index is not None
@@ -221,11 +336,15 @@ def export_trajectories_as_stl(
         else:
             z_world = (len(completed) + 1) * dz
 
-        z_mm = w2mm(z_world)
-        layer_xy = [(w2mm(p.x), w2mm(p.y)) for p in current]
-        triangles += _polyline_strip_triangles(
-            layer_xy, z=z_mm, line_w=line_w_mm, thick=thick_mm
-        )
+        layers_z_mm.append(w2mm(z_world))
+        layers_xy_mm.append([(w2mm(p.x), w2mm(p.y)) for p in current])
+
+    # C2: side walls only, continuous in Z, real thickness via outer+inner walls
+    triangles += _shell_walls_triangles_between_layers(
+        layers_xy=layers_xy_mm,
+        layers_z=layers_z_mm,
+        line_w=line_w_mm,
+    )
 
     _write_ascii_stl(triangles, out_path, solid_name="ilc_trajectories")
     print(f"[EXPORT] STL written: {out_path}  (triangles: {len(triangles)})")
@@ -240,11 +359,25 @@ class Point2D:
     y: float = 0.0
 
 
-def world_to_screen(val: float) -> int:
+# 2D VISUALIZER FIX: separate x and y mapping (y inverted for screen coordinates)
+def world_to_screen_x(val: float) -> int:
     return int(
         MARGIN
         + (val - WORLD_MIN) / (WORLD_MAX - WORLD_MIN) * (WINDOW_SIZE - 2 * MARGIN)
     )
+
+
+def world_to_screen_y(val: float) -> int:
+    return int(
+        WINDOW_SIZE
+        - MARGIN
+        - (val - WORLD_MIN) / (WORLD_MAX - WORLD_MIN) * (WINDOW_SIZE - 2 * MARGIN)
+    )
+
+
+def world_to_screen(val: float) -> int:
+    # kept for compatibility, treat as x-mapper
+    return world_to_screen_x(val)
 
 
 def _interpolate(p: Point2D, q: Point2D, t: float) -> Point2D:
@@ -841,12 +974,13 @@ class Visualizer:
     def draw_grid(self):
         color = self.COLORS["grid"]
         for val in [-1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5]:
-            pos = world_to_screen(val)
+            px = world_to_screen_x(val)
+            py = world_to_screen_y(val)
             pygame.draw.line(
-                self.surface, color, (pos, MARGIN), (pos, WINDOW_SIZE - MARGIN), 1
+                self.surface, color, (px, MARGIN), (px, WINDOW_SIZE - MARGIN), 1
             )
             pygame.draw.line(
-                self.surface, color, (MARGIN, pos), (WINDOW_SIZE - MARGIN, pos), 1
+                self.surface, color, (MARGIN, py), (WINDOW_SIZE - MARGIN, py), 1
             )
 
         pygame.draw.rect(
@@ -863,11 +997,11 @@ class Visualizer:
     ):
         if len(path) < 2:
             return
-        pts = [(world_to_screen(p.x), world_to_screen(p.y)) for p in path]
+        pts = [(world_to_screen_x(p.x), world_to_screen_y(p.y)) for p in path]
         pygame.draw.lines(self.surface, color, closed, pts, width)
 
     def draw_robot(self, pos: Point2D, color: Tuple[int, int, int], radius=10):
-        x, y = world_to_screen(pos.x), world_to_screen(pos.y)
+        x, y = world_to_screen_x(pos.x), world_to_screen_y(pos.y)
         pygame.draw.circle(self.surface, color, (x, y), radius)
         pygame.draw.circle(self.surface, (255, 255, 255), (x, y), radius, 2)
 
